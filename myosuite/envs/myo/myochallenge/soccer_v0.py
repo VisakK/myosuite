@@ -9,7 +9,9 @@ import numpy as np
 import os
 from enum import Enum
 from typing import Optional, Tuple
+from scipy.spatial.transform import Rotation as R
 
+import pdb
 import pink
 
 from myosuite.envs.myo.base_v0 import BaseV0
@@ -208,7 +210,11 @@ class SoccerEnvV0(WalkEnvV0):
         # Before setting the key_frames, the model and goalkeeper will be in the cartesian position,
         # causing the step() function to evaluate the initialization as "done".
         self.startFlag = False
-
+        self.init_torso_pitch = 0.0
+        self.init_torso_roll = 0.0
+        self.init_torso_yaw = 0.0
+        self.init_torso_positions = np.zeros(3)
+        
         # EzPickle.__init__(**locals()) is capturing the input dictionary of the init method of this class.
         # In order to successfully capture all arguments we need to call gym.utils.EzPickle.__init__(**locals())
         # at the leaf level, when we do inheritance like we do here.
@@ -266,6 +272,10 @@ class SoccerEnvV0(WalkEnvV0):
                        )
         self.init_qpos[:] = self.sim.model.key_qpos[0]
         self.init_qvel[:] = 0.0
+        self.init_torso_pitch = 0.0
+        self.init_torso_roll = 0.0
+        self.init_torso_yaw = 0.0
+        self.init_torso_positions = self.sim.data.body('torso').xpos.copy()
         self.startFlag = True
         self.assert_settings()
         self.goalkeeper.dt = self.sim.model.opt.timestep * self.frame_skip
@@ -336,8 +346,40 @@ class SoccerEnvV0(WalkEnvV0):
 
         pain = self.get_jnt_limit_violation() # Joint limit violation torque as pain score
         done = bool(goal_scored or time_limit_exceeded)
-        # ----------------------
+        
 
+        
+
+        torso_quaternion = self.obs_dict['torso_angle'][0][0]
+        torso_rotation = R.from_quat(torso_quaternion)
+        torso_euler = torso_rotation.as_euler('xyz', degrees=True)
+        torso_pitch = torso_euler[0]  # Assuming the first element is the pitch angle
+        torso_roll = torso_euler[1]  # Assuming the second element is the roll angle
+        torso_yaw = torso_euler[2]  # Assuming the third element is the yaw angle
+        delta_pitch = torso_pitch - self.init_torso_pitch
+        delta_roll = torso_roll - self.init_torso_roll
+        standup_reward = 1 if (abs(delta_pitch) < 45 or abs(delta_roll) < 45 or abs(torso_yaw - self.init_torso_yaw) < 45) else 0
+        alive = 1.0
+        #print(f"Torso pitch: {torso_pitch}, Torso roll: {torso_roll}, Delta pitch: {delta_pitch}, Delta roll: {delta_roll}, Standup reward: {standup_reward}")
+        #print("torso positions",self.sim.data.body('torso').xpos.copy())
+        # torso z position should be greater than 0.5
+        torso_z_pos = self.sim.data.body('torso').xpos[2]
+        #print(torso_z_pos)
+        # Joint positions should be zeros
+        joint_positions = self._get_joint_qpos()  # self.obs_dict['internal_qpos'][:self.sim.model.nq]  # Get only the joint positions
+        target_joint_positions = np.zeros_like(joint_positions)
+        joint_position_reward = np.exp(-0.5 * np.sum(np.square(joint_positions - target_joint_positions)))  # Negative reward for deviation from zero
+        
+        torso_positions = self.sim.data.body('torso').xpos.copy()
+        
+        torso_reward = np.exp(-2.5 * np.sum(np.square(torso_positions - self.init_torso_positions)))  # Negative reward for deviation from initial position
+        done = True if ((standup_reward == 0 or torso_z_pos < 0.65) and self.steps > 10) else False  # If the humanoid is not standing up, mark as done
+
+        #print(f"torso reward : {torso_reward}")
+        #print(f"joint position reward : {joint_position_reward}")
+
+
+        #done = (abs(torso_angle) > np.deg2rad(30))  # Add falling condition to done
         # Example reward, you should change this!
         distance = np.linalg.norm(obs_dict['model_root_pos'].flatten()[0:3] - obs_dict['ball_pos'].flatten())
 
@@ -356,9 +398,11 @@ class SoccerEnvV0(WalkEnvV0):
                 # Must keys
                 ('sparse',  float(done)),
                 ('solved',  float(goal_scored)),
-                ('done',  float(self._get_done())),
+                ('done',  float(done)),
             ))
-        rwd_dict['dense'] = np.sum([wt*rwd_dict[key] for key, wt in self.rwd_keys_wt.items()], axis=0)
+        rwd_dict['dense'] = joint_position_reward + standup_reward + torso_reward + alive - act_mag  #np.sum([wt*rwd_dict[key] for key, wt in self.rwd_keys_wt.items()], axis=0)
+        if done:
+            rwd_dict['dense'] = -1.0  # If done, give a negative reward
         # Success Indicator
         # self.sim.model.site_rgba[self.success_indicator_sid, :] = np.array([0, 2, 0, 0.2]) if rwd_dict['solved'] else np.array([2, 0, 0, 0])
         return rwd_dict
@@ -396,6 +440,14 @@ class SoccerEnvV0(WalkEnvV0):
         obs = super(WalkEnvV0, self).reset(reset_qpos=qpos, reset_qvel=qvel, **kwargs)
         self.goalkeeper.reset_goalkeeper(rng=self.np_random)
         self.sim.forward()
+        torso_quaternion = self.sim.data.body('torso').xquat.copy()
+        torso_rotation = R.from_quat(torso_quaternion)
+        torso_euler = torso_rotation.as_euler('xyz', degrees=True)
+        self.init_torso_pitch = torso_euler[0]  # Assuming the first element is the pitch angle
+        self.init_torso_roll = torso_euler[1]  # Assuming the second element is the roll angle
+        self.init_torso_yaw = torso_euler[2]  # Assuming the third element is the yaw angle
+
+        self.init_torso_positions = self.sim.data.body('torso').xpos.copy()
         return obs
 
     def _randomize_position_orientation(self, qpos, qvel):
@@ -423,9 +475,9 @@ class SoccerEnvV0(WalkEnvV0):
        Setup the default camera
        """
        distance = 5.0
-       azimuth = 90
+       azimuth = 0
        elevation = -15
-       lookat = None
+       lookat = self.sim.data.body('soccer_ball').xpos[:3].copy()
        self.sim.renderer.set_free_camera_settings(
                distance=distance,
                azimuth=azimuth,

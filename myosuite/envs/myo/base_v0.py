@@ -83,6 +83,8 @@ class BaseV0(env_base.MujocoEnv):
     def step(self, a, **kwargs):
         muscle_a = a.copy()
         muscle_act_ind = self.sim.model.actuator_dyntype == mujoco.mjtDyn.mjDYN_MUSCLE
+        #import pdb
+        #pdb.set_trace()
         # Explicitely project normalized space (-1,1) to actuator space (0,1) if muscles
         if self.sim.model.na and self.normalize_act:
             # find muscle actuators
@@ -97,6 +99,7 @@ class BaseV0(env_base.MujocoEnv):
             isNormalized = self.normalize_act  # accept requested reprojection
 
         # implement abnormalities
+
         if self.muscle_condition == "fatigue":
             # import ipdb; ipdb.set_trace()
             muscle_a[muscle_act_ind], _, _ = self.muscle_fatigue.compute_act(
@@ -108,6 +111,7 @@ class BaseV0(env_base.MujocoEnv):
             # Set EIP to 0
             muscle_a[self.EIPpos] = 0
         # step forward
+    
         self.last_ctrl = self.robot.step(
             ctrl_desired=muscle_a,
             ctrl_normalized=isNormalized,
