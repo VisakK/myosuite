@@ -1,11 +1,11 @@
-from stable_baselines3 import PPO
+from stable_baselines3 import PPO, SAC
 import torch.nn as nn
 import wandb
 from wandb.integration.sb3 import WandbCallback
 from myosuite.utils import gym
 from stable_baselines3.common.policies import ActorCriticPolicy
 
-policy = PPO.load("./policies/stand_policy_p1")
+policy = SAC.load("./policies/stand_policy_p1_SAC")
 
 step = 0 
 env = gym.make('myoChallengeSoccerP1-v0')
