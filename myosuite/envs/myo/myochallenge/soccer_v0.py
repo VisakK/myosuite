@@ -347,9 +347,6 @@ class SoccerEnvV0(WalkEnvV0):
         pain = self.get_jnt_limit_violation() # Joint limit violation torque as pain score
         done = bool(goal_scored or time_limit_exceeded)
         
-
-        
-
         torso_quaternion = self.obs_dict['torso_angle'][0][0]
         torso_rotation = R.from_quat(torso_quaternion)
         torso_euler = torso_rotation.as_euler('xyz', degrees=True)
@@ -358,7 +355,10 @@ class SoccerEnvV0(WalkEnvV0):
         torso_yaw = torso_euler[2]  # Assuming the third element is the yaw angle
         delta_pitch = torso_pitch - self.init_torso_pitch
         delta_roll = torso_roll - self.init_torso_roll
-        standup_reward = 1 if (abs(delta_pitch) < 45 or abs(delta_roll) < 45 or abs(torso_yaw - self.init_torso_yaw) < 45) else 0
+        delta_yaw = torso_yaw - self.init_torso_yaw
+        total_euler_delta = delta_pitch + delta_roll + delta_yaw
+
+        standup_reward = 1 if (abs(delta_pitch) < 45 or abs(delta_roll) < 45 or abs(delta_yaw) < 45) else 0
         alive = 1.0
         #print(f"Torso pitch: {torso_pitch}, Torso roll: {torso_roll}, Delta pitch: {delta_pitch}, Delta roll: {delta_roll}, Standup reward: {standup_reward}")
         #print("torso positions",self.sim.data.body('torso').xpos.copy())
@@ -368,11 +368,14 @@ class SoccerEnvV0(WalkEnvV0):
         # Joint positions should be zeros
         joint_positions = self._get_joint_qpos()  # self.obs_dict['internal_qpos'][:self.sim.model.nq]  # Get only the joint positions
         target_joint_positions = np.zeros_like(joint_positions)
-        joint_position_reward = np.exp(-0.5 * np.sum(np.square(joint_positions - target_joint_positions)))  # Negative reward for deviation from zero
+        joint_position_reward = np.exp(-5.0 * np.sum(np.square(joint_positions - target_joint_positions)))  # Negative reward for deviation from zero
         
+        joint_velocity = self._get_joint_qvel() * self.dt  # Get joint velocities
+        joint_velocity_reward = - 10 * np.sum(np.square(joint_velocity))  # Negative reward for joint velocity
         torso_positions = self.sim.data.body('torso').xpos.copy()
-        
-        torso_reward = np.exp(-2.5 * np.sum(np.square(torso_positions - self.init_torso_positions)))  # Negative reward for deviation from initial position
+
+        torso_euler_reward = np.exp(-0.005 *(np.square(total_euler_delta)))  # Negative reward for deviation from initial orientation
+        torso_reward = np.exp(-20.0 * np.sum(np.square(torso_positions - self.init_torso_positions)))  # Negative reward for deviation from initial position
         done = True if ((standup_reward == 0 or torso_z_pos < 0.65) and self.steps > 10) else False  # If the humanoid is not standing up, mark as done
 
         #print(f"torso reward : {torso_reward}")
@@ -400,7 +403,13 @@ class SoccerEnvV0(WalkEnvV0):
                 ('solved',  float(goal_scored)),
                 ('done',  float(done)),
             ))
-        rwd_dict['dense'] = joint_position_reward + standup_reward + torso_reward + alive - act_mag  #np.sum([wt*rwd_dict[key] for key, wt in self.rwd_keys_wt.items()], axis=0)
+
+        #print("Torso Euler Reward:", torso_euler_reward)
+        #print("Torso Reward:", torso_reward)
+        #print("Joint Position Reward:", joint_position_reward)
+        #print("Standup Reward:", standup_reward)
+        #print("Joint Velocity Reward:", joint_velocity_reward)
+        rwd_dict['dense'] = joint_velocity_reward + joint_position_reward + torso_euler_reward + standup_reward + torso_reward + alive - 100 * act_mag  #np.sum([wt*rwd_dict[key] for key, wt in self.rwd_keys_wt.items()], axis=0)
         if done:
             rwd_dict['dense'] = -1.0  # If done, give a negative reward
         # Success Indicator
