@@ -18,7 +18,7 @@ model = SAC("MlpPolicy", env,
             policy_kwargs= policy_kwargs,
             verbose=1,
             use_sde=True,
-            use_sde_at_warmup=False,
+            use_sde_at_warmup=True,
             tensorboard_log="./ppo_myo_challenge_soccer_p1_tensorboard/",
             policy_name="./policies/" + policy_name)
 
