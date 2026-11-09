@@ -109,6 +109,29 @@ def _mimic_cache_key(env: Any, entity_name: str, variant: str) -> tuple[int, str
     return key
 
 
+# Compiled models that override the stock MuscleMimic body for one entity name
+# (see :func:`set_mimic_entity_model`).
+_MIMIC_ENTITY_MODELS: dict[str, Any] = {}
+
+
+def set_mimic_entity_model(entity_name: str, mj_model: Any | None) -> None:
+    """Resolve the mimic sites and clips of *entity_name* against *mj_model*.
+
+    The mimic closures otherwise rebuild the stock MuscleMimic body to look up
+    site ids and to expand clips; an entity built from an edited body (e.g. one
+    scaled to a subject, or with extra joints) must register its own compiled
+    model here before its env is constructed. ``None`` removes the override.
+
+    Args:
+        entity_name: Scene entity name used by the task.
+        mj_model: Compiled model of that entity, with the same mimic sites.
+    """
+    if mj_model is None:
+        _MIMIC_ENTITY_MODELS.pop(entity_name, None)
+    else:
+        _MIMIC_ENTITY_MODELS[entity_name] = mj_model
+
+
 _MIMIC_REWARD_MODE_MIMIC = "mimic"
 _MIMIC_REWARD_MODE_ENV = "env"
 _MIMIC_REWARD_MODE_AUGMENTED = "augmented"
@@ -720,8 +743,10 @@ def _resolve_mimic_mjlab_ids(
         )
 
         cfg = default_mimic_fullbody_config()
-        spec, _ = build_mimic_fullbody_spec(config_dict.create(**dict(cfg)))
-        mj_model = spec.compile()
+        mj_model = _MIMIC_ENTITY_MODELS.get(entity_name)
+        if mj_model is None:
+            spec, _ = build_mimic_fullbody_spec(config_dict.create(**dict(cfg)))
+            mj_model = spec.compile()
         site_names = tuple(FULLBODY_BODY2SITES_FOR_MIMIC.values())
         tracking = MimicTrackingConfig(
             reward_scale=float(cfg.tracking_reward_scale),
@@ -1366,6 +1391,7 @@ def _mimic_early_termination(
     site_err_threshold: float = 1.0,
     root_err_threshold: float = 0.3,
     use_clip_root: bool = True,
+    max_site_err_threshold: float | None = None,
 ) -> Callable[[Any], Any]:
     """Terminate episodes where tracking error exceeds recovery threshold.
 
@@ -1416,6 +1442,7 @@ def _mimic_early_termination(
             ref_root,
             site_err_threshold=site_err_threshold,
             root_err_threshold=root_err_threshold,
+            max_site_err_threshold=max_site_err_threshold,
         )
         # Past the clip end the reference is undefined: that is a truncation.
         if clip_source is not None:
@@ -1514,6 +1541,7 @@ def _make_mimic_env_cfg(
     enable_clip_state_terms: bool = True,
     reward_mode: str = _MIMIC_REWARD_MODE_MIMIC,
     mimic_reward_weight: float = 5.0,
+    max_site_err_threshold: float | None = None,
 ) -> Any:
     """Build :class:`~mjlab.envs.ManagerBasedRlEnvCfg` for one Mimic task.
 
@@ -1544,6 +1572,8 @@ def _make_mimic_env_cfg(
             training path's canonical action normalisation; ``"direct"``
             preserves checkpoint playback by clipping incoming values to
             ``[-1, 1]`` before writing them as muscle controls.
+        max_site_err_threshold: Optional per-site deviation (m) that also ends an
+            episode early; ``None`` keeps the mean-site and root rules only.
 
     Returns:
         A configured :class:`~mjlab.envs.ManagerBasedRlEnvCfg` instance.
@@ -1661,6 +1691,7 @@ def _make_mimic_env_cfg(
                 clip,
                 ctrl_dt,
                 use_clip_root=enable_clip_state_terms,
+                max_site_err_threshold=max_site_err_threshold,
             ),
             time_out=False,
         )
@@ -2760,6 +2791,7 @@ def default_mimic_clip_on_policy_runner_cfg(**kwargs) -> Any:
 
 
 __all__ = [
+    "set_mimic_entity_model",
     "SARMuscleActivationAction",
     "SARMuscleActivationActionCfg",
     "ClipTrajectorySource",

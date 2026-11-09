@@ -158,6 +158,7 @@ def mimic_termination_mask(
     ref_root_pos: Any | None,
     site_err_threshold: float = 1.0,
     root_err_threshold: float = 0.3,
+    max_site_err_threshold: float | None = None,
 ) -> Any:
     """Batched MuscleMimic early-termination test for any array backend.
 
@@ -165,6 +166,8 @@ def mimic_termination_mask(
     ``site_err_threshold`` or the root position error exceeds
     ``root_err_threshold``.  The root check needs the clip's reference root
     (the free-joint position); pass ``None`` for models without a free root.
+    With ``max_site_err_threshold`` set, any single site farther than it from
+    its target also terminates (a per-body deviation rule).
 
     Args:
         xp: Array module (``numpy``, ``jax.numpy`` or ``torch``).
@@ -174,13 +177,16 @@ def mimic_termination_mask(
         ref_root_pos: Shape ``(..., 3)`` or ``None`` to disable root checks.
         site_err_threshold: Mean site distance threshold in metres.
         root_err_threshold: Root position L2 distance threshold in metres.
+        max_site_err_threshold: Optional per-site distance threshold in metres.
 
     Returns:
         Boolean array of shape ``(...)``.
     """
     diff = current_site_pos - ref_site_pos
-    mean_site_err = xp.sqrt((diff * diff).sum(axis=-1)).mean(axis=-1)
-    terminate = mean_site_err > site_err_threshold
+    site_err = xp.sqrt((diff * diff).sum(axis=-1))
+    terminate = site_err.mean(axis=-1) > site_err_threshold
+    if max_site_err_threshold is not None:
+        terminate = terminate | (site_err > max_site_err_threshold).any(axis=-1)
     if current_root_pos is None or ref_root_pos is None:
         return terminate
     root_diff = current_root_pos - ref_root_pos
