@@ -262,6 +262,14 @@ class Retargeter:
             are defined (same kinematics); ``model`` itself when ``None``.
         brace_allowance: With self-collision, the overlap (m) two primitives may keep
             before an IK term pushes them apart; ``None`` ignores body-body contact.
+        split_hand_contacts: Seat the hands: when the plant's ``Wrist`` (palm) or
+            ``Hand`` (fingers) touches the floor, the four bottom corners of that part's
+            box collider are pulled onto it. Otherwise both parts map to the whole hand and
+            only its lowest point is pulled, which leaves the hand tilted heel-down with
+            the fingertips off the floor.
+        lock_elbows_deg: In frames where a hand touches the floor, an elbow flexed less
+            than this (deg) is set straight and held there while the frame is re-solved
+            (straight-arm supports carry load on the locked elbow); ``None``: off.
     """
 
     def __init__(
@@ -271,9 +279,13 @@ class Retargeter:
         her: dict[str, np.ndarray],
         registration: mujoco.MjModel | None = None,
         brace_allowance: float | None = None,
+        split_hand_contacts: bool = False,
+        lock_elbows_deg: float | None = None,
     ) -> None:
         self.model = model
         self.brace_allowance = brace_allowance
+        self.lock_elbows_deg = lock_elbows_deg
+        self._flat_parts: set[str] = set()
         self._reg = model if registration is None else registration
         self.data = mujoco.MjData(model)
         self.rk = ReducedKinematics(model)
@@ -304,8 +316,25 @@ class Retargeter:
                     and model.body(model.geom_bodyid[i]).name in hand[s]
                 ]
             )
-            self._contact_geoms[f"{S}_Wrist"] = g
-            self._contact_geoms[f"{S}_Hand"] = g
+            for part in ("Wrist", "Hand"):
+                own = np.array(
+                    [
+                        i
+                        for i in g
+                        if model.geom(int(i)).name.startswith(f"plant_{S}_{part}_")
+                    ]
+                )
+                self._contact_geoms[f"{S}_{part}"] = (
+                    own if split_hand_contacts and len(own) else g
+                )
+                if split_hand_contacts and len(own):
+                    self._flat_parts.add(f"{S}_{part}")
+        indep = list(self.rk.indep_dof)
+        self._elbows = {
+            S: (int(model.jnt_qposadr[model.joint(f"elbow_flex_{s}").id]),
+                indep.index(int(model.jnt_dofadr[model.joint(f"elbow_flex_{s}").id])))
+            for s, S in sb.PLANT_SIDE.items()
+        }  # fmt: skip
         prior = [
             j
             for j in range(model.njnt)
@@ -527,6 +556,19 @@ class Retargeter:
             gs = self._contact_geoms.get(pb)
             if gs is None or len(gs) == 0:
                 continue
+            if pb in self._flat_parts:
+                for g in gs:
+                    if m.geom_type[g] != mujoco.mjtGeom.mjGEOM_BOX:
+                        continue
+                    pts = _box_corners(
+                        d.geom_xpos[g], d.geom_xmat[g].reshape(3, 3), m.geom_size[g]
+                    )
+                    for pt in pts[np.argsort(pts[:, 2])[:4]]:
+                        jp = np.zeros((3, m.nv))
+                        mujoco.mj_jac(m, d, jp, None, pt, int(m.geom_bodyid[g]))
+                        rows.append(np.array([w_contact * pt[2]]))
+                        jac.append(w_contact * jp[2:3])
+                continue
             ks = [gindex[g] for g in gs]
             k = ks[int(np.argmin(low[ks, 2]))]
             if low[k, 2] < 0.0:
@@ -559,8 +601,12 @@ class Retargeter:
     def solve_frame(
         self, q0: np.ndarray, tgt: np.ndarray, contact: list[str], q_prev: np.ndarray | None,
         iters: int = 8, w_contact: float = 2.0, w_pen: float = 5.0, w_reg: float = 0.02,
+        frozen: tuple[int, ...] = (),
     ) -> tuple[np.ndarray, float]:  # fmt: skip
-        """Projected LM on the independent coordinates; returns ``(qpos, cost)``."""
+        """Projected LM on the independent coordinates; returns ``(qpos, cost)``.
+
+        Independent coordinates listed in *frozen* keep their value from *q0*.
+        """
         m = self.model
         q = self.rk.clamp(q0)
         r, Jf = self._residual(q, tgt, contact, q_prev, w_contact, w_pen, w_reg)
@@ -569,6 +615,7 @@ class Retargeter:
         for _ in range(iters):
             T = self.rk.velocity_map(q)
             J = Jf @ T
+            J[:, list(frozen)] = 0.0
             H = J.T @ J
             g = J.T @ r
             dq = np.linalg.solve(
@@ -640,12 +687,38 @@ class Retargeter:
                 if cc < c:
                     q, c = qc, cc
                     restarts += 1
+            if self.lock_elbows_deg is not None:
+                q, c = self._lock_elbows(q, c, tg[t], cs, prev, iters)
             costs.append(c)
             Q[t] = q
             prev = q
         met = self.metrics(Q, tg, contact)
         met["cold_restarts"] = restarts
         return Q, met
+
+    def _lock_elbows(
+        self, q: np.ndarray, cost: float, tgt: np.ndarray, contact: list[str],
+        q_prev: np.ndarray | None, iters: int,
+    ) -> tuple[np.ndarray, float]:  # fmt: skip
+        """Re-solve a frame with straight-arm supporting elbows locked at 0."""
+        lim = np.radians(float(self.lock_elbows_deg))
+        lock = [
+            (qadr, col) for S, (qadr, col) in self._elbows.items()
+            if (f"{S}_Wrist" in contact or f"{S}_Hand" in contact) and q[qadr] < lim
+        ]  # fmt: skip
+        if not lock:
+            return q, cost
+        q0 = q.copy()
+        for qadr, _ in lock:
+            q0[qadr] = 0.0
+        return self.solve_frame(
+            q0,
+            tgt,
+            contact,
+            q_prev,
+            iters=max(iters, 20),
+            frozen=tuple(c for _, c in lock),
+        )
 
     def metrics(self, Q: np.ndarray, tg: np.ndarray, contact: np.ndarray) -> dict:
         """Landmark errors, support float, penetration and joint-box saturation."""
@@ -741,6 +814,14 @@ def _support(
     return c.copy()
 
 
+def _box_corners(c: np.ndarray, R: np.ndarray, size: np.ndarray) -> np.ndarray:
+    """``(8, 3)`` world corners of a box with centre *c*, rotation *R* and half-sizes *size*."""
+    signs = np.array(
+        [[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)], float
+    )
+    return c + (signs * np.asarray(size)[:3]) @ R.T
+
+
 def _lowest_points(
     gtype: np.ndarray, c: np.ndarray, R: np.ndarray, s: np.ndarray
 ) -> np.ndarray:
@@ -807,7 +888,17 @@ def write_clip(model: mujoco.MjModel, Q: np.ndarray, hz: float, path: Path) -> N
 
 
 def _worker(job: tuple) -> tuple[str, dict]:
-    table_path, mosh_pkl, smplx, plant_xml, ref_path, out_dir, brace_allowance = job
+    (
+        table_path,
+        mosh_pkl,
+        smplx,
+        plant_xml,
+        ref_path,
+        out_dir,
+        brace_allowance,
+        split_hands,
+        lock_elbows,
+    ) = job
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     table = sb.SubjectTable.load(Path(table_path))
     model = sb.compile_spec(sb.build_subject_spec(table))
@@ -818,6 +909,8 @@ def _worker(job: tuple) -> tuple[str, dict]:
         sb.her_template(Path(mosh_pkl), Path(smplx)),
         registration=reg,
         brace_allowance=brace_allowance,
+        split_hand_contacts=split_hands,
+        lock_elbows_deg=lock_elbows,
     )
     ref = load_reference(Path(ref_path))
     Q, met = rt.retarget(ref)
@@ -849,6 +942,14 @@ def main() -> None:
         default=None,
         help="with a self-colliding table: overlap (m) allowed between primitives",
     )
+    ap.add_argument(
+        "--split-hand-contacts", action="store_true",
+        help="pull the palm and the finger colliders onto the floor separately (seats the hand)",
+    )  # fmt: skip
+    ap.add_argument(
+        "--lock-elbows", type=float, default=None, metavar="DEG",
+        help="straighten supporting elbows flexed less than DEG (hand on the floor)",
+    )  # fmt: skip
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     refs = sorted(args.refs.glob("*.npz"))
@@ -863,6 +964,8 @@ def main() -> None:
             str(r),
             str(args.out),
             args.brace_allowance,
+            args.split_hand_contacts,
+            args.lock_elbows,
         )
         for r in refs
     ]

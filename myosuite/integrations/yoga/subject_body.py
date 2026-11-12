@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 import mujoco
@@ -75,6 +75,41 @@ YOGA_RANGES_DEG: dict[str, tuple[float, float]] = {
 }  # fmt: skip
 # The knee couplings (tibia/patella translations and rotations) were fitted on 0-120 deg.
 KNEE_COUPLING_FIT_DEG = 120.0
+
+# Extrinsic finger flexors kept by ``SubjectTable.finger_flexors`` (right names; left: "_left").
+FINGER_FLEXORS: tuple[str, ...] = (
+    *(f"FDS{i}" for i in range(2, 6)), *(f"FDP{i}" for i in range(2, 6)), "FPL",
+)  # fmt: skip
+# Wrist obstacles (radius m, side +1 palmar / -1 dorsal). The radii are measured flexion
+# moment arms, roughly constant over the range: FCR, FCU, ECRL, ECRB, ECU from Garland et
+# al. 2018 (12.2, 11.3, 6.6, 10.8, 4.0 mm); FDS/FDP ~1.1 cm at 40-60 deg extension and
+# FPL from Gonzalez et al. 1997; PL below its 2.1 cm at neutral.
+WRIST_OBSTACLES: dict[str, tuple[float, int]] = {
+    "FCR": (0.012, 1), "FCU": (0.011, 1), "PL": (0.014, 1),
+    "ECRL": (0.007, -1), "ECRB": (0.010, -1), "ECU": (0.004, -1),
+    **{f"FDS{i}": (0.011, 1) for i in range(2, 6)},
+    **{f"FDP{i}": (0.011, 1) for i in range(2, 6)},
+    "FPL": (0.010, 1),
+}  # fmt: skip
+# Wrap spheres up to this radius in a wrist path act as via points (see _repair_wrist_paths).
+WRIST_TINY_WRAP_M = 0.003
+WRAP_GROUP = 3
+# A stiff end-range: the limit's force per radian is ~ d / (1 - d) * k * m_eff. Measured on the
+# seated handstand wrist: ~9 N m per degree past the limit, ~6x MuJoCo's default (solref 0.02,
+# solimp 0.9-0.95). The time constant stays above refsafe's 2 * timestep.
+STIFF_LIMIT_SOLREF: tuple[float, ...] = (0.01, 1.0)
+STIFF_LIMIT_SOLIMP: tuple[float, ...] = (0.99, 0.995, 0.001, 0.5, 2.0)
+# Active-F0 factors (right names; applied to both sides). SUPSP's gainprm holds the
+# supinator's 339.1 N; its biasprm and the older MyoArm keep 496.7 N (MoBL-ARMS 499.2 N).
+SUPSP_FIX: dict[str, float] = {"SUPSP": 496.738 / 339.132}
+# TMIN, TMAJ, INFSP and LAT2 are 2.0, 2.0, 2.0 and 1.69x their MoBL-ARMS forces (269.5,
+# 144.0, 1075.8, 317.5 N), an undocumented edit; these factors restore the MoBL-ARMS values.
+SHOULDER_EDIT_UNDO: dict[str, float] = {
+    "TMIN": 269.5 / 539.0, "TMAJ": 144.0 / 288.0, "INFSP": 1075.8 / 2150.71, "LAT2": 317.5 / 535.42,
+}  # fmt: skip
+# Wrist extension (deg) the round-3 plant allows: her clips need at least 100 deg (the range
+# audit's box), and a flat hand on the floor needs the hand seated past MyoArm's 45 deg.
+R3_WRIST_EXTENSION_DEG = 110.0
 
 # Plant body groups whose masses define each MyoFullBody mass group.
 PLANT_MASS_GROUPS: dict[str, tuple[str, ...]] = {
@@ -273,6 +308,20 @@ class SubjectTable:
         passive_scale: Muscle name -> factor on ``fpmax`` (passive force only; the
             active force-length curve is unchanged). See
             :func:`myosuite.integrations.yoga.statics.fit_passive_compliance`.
+        finger_flexors: Keep the extrinsic finger flexors (:data:`FINGER_FLEXORS`), which
+            MuscleMimic removes with the finger joints. The fingers stay welded straight,
+            so these muscles act on the wrist (and the elbow).
+        wrist_obstacles: Muscle -> ``[radius (m), side]`` (side +1 palmar, -1 dorsal):
+            a cylinder on the wrist flexion axis that the muscle's path wraps around
+            whenever it would pass closer to the axis (:func:`_repair_wrist_paths`).
+            MyoArm's paths are built for ±45° of wrist flexion and lose or invert their
+            moment arms beyond it.
+        limit_solref: Joint name -> ``solref`` of its range limit.
+        limit_solimp: Joint name -> ``solimp`` of its range limit. A stiff end-range
+            (ligament and bone, :data:`STIFF_LIMIT_SOLREF`) instead of MuJoCo's default
+            soft limit, whose stiffness scales with a light distal segment's inertia.
+        strength_scale: Muscle name -> factor on the active peak force F0
+            (``gainprm[2]``); the passive force (``biasprm``) keeps its fitted value.
         colliders: Floor-contact primitives replacing MyoFullBody's own colliders
             (which stay as visual geoms): ``{body, type, size, pos, quat}`` in the
             MyoFullBody body frame. Filled by
@@ -296,19 +345,29 @@ class SubjectTable:
     self_collision: bool = False
     passive_scale: dict[str, float] = field(default_factory=dict)
     measured: dict = field(default_factory=dict)
+    finger_flexors: bool = False
+    wrist_obstacles: dict[str, list[float]] = field(default_factory=dict)
+    limit_solref: dict[str, list[float]] = field(default_factory=dict)
+    limit_solimp: dict[str, list[float]] = field(default_factory=dict)
+    strength_scale: dict[str, float] = field(default_factory=dict)
 
     def save(self, path: Path) -> None:
         """Write as JSON."""
         path.write_text(json.dumps(asdict(self), indent=1))
 
     @staticmethod
-    def load(path: Path) -> "SubjectTable":
+    def load(path: Path) -> SubjectTable:
         """Read a JSON table."""
         return SubjectTable(**json.loads(Path(path).read_text()))
 
 
-def base_fullbody_spec() -> mujoco.MjSpec:
-    """A private copy of the MuscleMimic MyoFullBody spec (fingers removed, mimic sites)."""
+def base_fullbody_spec(finger_flexors: bool = False) -> mujoco.MjSpec:
+    """A private copy of the MuscleMimic MyoFullBody spec (fingers removed, mimic sites).
+
+    Args:
+        finger_flexors: Keep the extrinsic finger flexors (:data:`FINGER_FLEXORS`). The
+            finger joints are removed either way, so the fingers stay welded straight.
+    """
     from ml_collections import config_dict
 
     from myosuite.integrations.musclemimic.fullbody_model import (
@@ -316,10 +375,34 @@ def base_fullbody_spec() -> mujoco.MjSpec:
         default_mimic_fullbody_config,
     )
 
-    spec, _ = build_mimic_fullbody_spec(
-        config_dict.create(**dict(default_mimic_fullbody_config()))
-    )
+    cfg = dict(default_mimic_fullbody_config())
+    cfg["disable_fingers"] = not finger_flexors
+    spec, _ = build_mimic_fullbody_spec(config_dict.create(**cfg))
+    if finger_flexors:
+        _weld_fingers(spec, keep=FINGER_FLEXORS)
     return spec
+
+
+def _weld_fingers(spec: mujoco.MjSpec, keep: tuple[str, ...]) -> None:
+    """Remove the finger joints and every finger muscle except *keep* (both sides)."""
+    from myosuite.integrations.musclemimic.bimanual_model import (
+        FINGER_JOINT_TOKENS,
+        FINGER_MUSCLE_TOKENS,
+    )
+
+    kept = {n for k in keep for n in (k, f"{k}_left")}
+    for joint in [j for j in spec.joints if j.name in FINGER_JOINT_TOKENS]:
+        spec.delete(joint)
+    gone = [
+        a
+        for a in spec.actuators
+        if a.name in FINGER_MUSCLE_TOKENS and a.name not in kept
+    ]
+    tendons = {a.target for a in gone}
+    for act in gone:
+        spec.delete(act)
+    for tendon in [t for t in spec.tendons if t.name in tendons]:
+        spec.delete(tendon)
 
 
 def compile_spec(spec: mujoco.MjSpec, timestep: float = 0.002) -> mujoco.MjModel:
@@ -518,6 +601,150 @@ def _add_neck(spec: mujoco.MjSpec, model: mujoco.MjModel, gear: float) -> None:
         act.ctrllimited = mujoco.mjtLimited.mjLIMITED_TRUE
 
 
+_TENDON_ATTRS = (
+    "width", "rgba", "group", "material", "limited", "range", "actfrclimited", "actfrcrange",
+    "stiffness", "damping", "springlength", "margin", "frictionloss", "armature",
+    "solref_limit", "solimp_limit", "solref_friction", "solimp_friction", "userdata",
+)  # fmt: skip
+
+
+def _arm_name(name: str, side: str) -> str:
+    """MyoArm names carry no suffix on the right and ``_left`` on the left."""
+    return name if side == "r" else f"{name}_left"
+
+
+def _tendon_path(model: mujoco.MjModel, tendon: str) -> list[tuple[str, ...]]:
+    """``("site", name)`` and ``("geom", name, sidesite)`` items of a spatial tendon."""
+    tid = model.tendon(tendon).id
+    out: list[tuple[str, ...]] = []
+    for w in range(
+        model.tendon_adr[tid], model.tendon_adr[tid] + model.tendon_num[tid]
+    ):
+        obj = int(model.wrap_objid[w])
+        if model.wrap_type[w] == mujoco.mjtWrap.mjWRAP_SITE:
+            out.append(("site", model.site(obj).name))
+        else:
+            side = int(model.wrap_prm[w])
+            out.append(
+                (
+                    "geom",
+                    model.geom(obj).name,
+                    model.site(side).name if side >= 0 else "",
+                )
+            )
+    return out
+
+
+def _rebuild_tendon(
+    spec: mujoco.MjSpec, name: str, path: list[tuple[str, ...]]
+) -> None:
+    """Replace a spatial tendon by one with the same name, attributes and a new path.
+
+    (``MjsTendonPath`` cannot be edited in place; actuators refer to tendons by name.)
+    """
+    old = spec.tendon(name)
+    attrs = {a: getattr(old, a) for a in _TENDON_ATTRS}
+    spec.delete(old)
+    new = spec.add_tendon(name=name)
+    for a, v in attrs.items():
+        setattr(new, a, v.copy() if isinstance(v, np.ndarray) else v)
+    for item in path:
+        if item[0] == "site":
+            new.wrap_site(item[1])
+        else:
+            new.wrap_geom(item[1], item[2])
+
+
+def _palmar_direction(model: mujoco.MjModel, side: str) -> np.ndarray:
+    """Unit palmar direction in the lunate frame, perpendicular to the wrist flexion axis."""
+    data = _rest(model)
+    lb = model.body(f"lunate_{side}").id
+    R, p = data.xmat[lb].reshape(3, 3), data.xpos[lb]
+    axis = model.jnt_axis[model.joint(f"flexion_{side}").id]
+    hand = R.T @ (data.xpos[model.body(f"thirdmc_{side}").id] - p)
+    hand = hand - axis * (axis @ hand)
+    palmar = np.cross(axis, hand / np.linalg.norm(hand))
+    flexor = R.T @ (data.site_xpos[model.site(_arm_name("FCR-P2", side)).id] - p)
+    return palmar if palmar @ flexor > 0 else -palmar
+
+
+def _repair_wrist_paths(
+    spec: mujoco.MjSpec, model: mujoco.MjModel, table: SubjectTable
+) -> None:
+    """Keep the wrist muscles' moment arms physiological beyond MyoArm's ±45° range.
+
+    MyoArm's wrist paths come from a model built for ±45° of flexion. Further out the
+    flexors' moment arms fall to 0.3-0.5 cm (measured: ~1.1-1.2 cm, roughly constant) and
+    ECRL/ECRB turn into flexors, because the insertions sit within a centimetre of the
+    axis and sweep across it. For each muscle of ``table.wrist_obstacles``, a cylinder on
+    the flexion axis is put in the path segment that crosses the wrist (last point on the
+    forearm to first point on the hand). The tendon wraps around it on its anatomical
+    side whenever it would pass closer to the axis than the radius; inside ±45° the paths
+    stay outside it. Wrap spheres of at most :data:`WRIST_TINY_WRAP_M` become via points
+    at their centres, except on the dorsal side of the hand, where a point fixed to the
+    hand passes over the joint beyond ~70° of extension and inverts the extensor: there
+    they are dropped.
+
+    Args:
+        spec: Spec being built (geometry already scaled).
+        model: The compiled base model (path layout, rest geometry).
+        table: Subject table (obstacles, hand scale).
+    """
+    muscles = {model.actuator(i).name: i for i in range(model.nu)}
+    quat = np.zeros(4)
+    for side in SIDES:
+        hand = {model.body(n).id for n in _descendants(model, f"lunate_{side}")}
+        jid = model.joint(f"flexion_{side}").id
+        centre, axis = model.jnt_pos[jid], model.jnt_axis[jid]
+        mujoco.mju_quatZ2Vec(quat, axis)
+        palmar = _palmar_direction(model, side)
+        lunate = spec.body(f"lunate_{side}")
+        k = float(table.segment_scale.get(f"hand_{side}", 1.0))
+        for base_name, (radius, sgn) in table.wrist_obstacles.items():
+            muscle = _arm_name(base_name, side)
+            if muscle not in muscles:
+                continue
+            tendon = model.tendon(int(model.actuator_trnid[muscles[muscle], 0])).name
+            r = radius * k
+            geom = lunate.add_geom(
+                name=f"{muscle}_wrist_obstacle", type=mujoco.mjtGeom.mjGEOM_CYLINDER,
+                size=[r, 0.025, 0.0], pos=centre, quat=quat, contype=0, conaffinity=0,
+                group=WRAP_GROUP, rgba=[0.19, 0.83, 0.78, 0.2],
+            )  # fmt: skip
+            sidesite = lunate.add_site(
+                name=f"{muscle}_wrist_side", pos=centre + sgn * palmar * (r + 0.004),
+                size=[0.001, 0.0, 0.0], group=WRAP_GROUP,
+            )  # fmt: skip
+            path: list[tuple] = []
+            for item in _tendon_path(model, tendon):
+                if item[0] == "site":
+                    path.append((*item, int(model.site_bodyid[model.site(item[1]).id])))
+                    continue
+                gid = model.geom(item[1]).id
+                body = int(model.geom_bodyid[gid])
+                if model.geom_size[gid][0] > WRIST_TINY_WRAP_M:
+                    path.append(item)
+                elif sgn > 0 or body not in hand:
+                    via = spec.body(model.body(body).name).add_site(
+                        name=f"{muscle}_{item[1]}_via", pos=np.asarray(spec.geom(item[1]).pos),
+                        size=[0.001, 0.0, 0.0], group=WRAP_GROUP,
+                    )  # fmt: skip
+                    path.append(("site", via.name, body))
+            sites = [i for i, it in enumerate(path) if it[0] == "site"]
+            j = next(
+                j for j in range(1, len(sites))
+                if path[sites[j]][2] in hand and path[sites[j - 1]][2] not in hand
+            )  # fmt: skip
+            path = (
+                path[: sites[j - 1] + 1]
+                + [("geom", geom.name, sidesite.name)]
+                + path[sites[j] :]
+            )
+            _rebuild_tendon(
+                spec, tendon, [it[:2] if it[0] == "site" else it for it in path]
+            )
+
+
 def build_subject_spec(
     table: SubjectTable, base: mujoco.MjSpec | None = None
 ) -> mujoco.MjSpec:
@@ -530,12 +757,14 @@ def build_subject_spec(
     Returns:
         The edited (uncompiled) spec.
     """
-    spec = base_fullbody_spec() if base is None else base
+    spec = base_fullbody_spec(table.finger_flexors) if base is None else base
     model = compile_spec(spec.copy())
     _freeze_inertials(spec, model)
     _scale_geometry(spec, model, table)
     _scale_masses(spec, model, table)
     _apply_ranges(spec, model, table)
+    if table.wrist_obstacles:
+        _repair_wrist_paths(spec, model, table)
     for act in spec.actuators:
         if act.name in table.lengthrange:
             act.lengthrange = np.asarray(table.lengthrange[act.name], float)
@@ -544,6 +773,15 @@ def build_subject_spec(
                 v = np.asarray(getattr(act, prm), float).copy()
                 v[7] *= table.passive_scale[act.name]  # fpmax
                 setattr(act, prm, v)
+        if act.name in table.strength_scale:
+            v = np.asarray(act.gainprm, float).copy()
+            v[2] *= table.strength_scale[act.name]  # active F0 only
+            act.gainprm = v
+    for joint in spec.joints:
+        if joint.name in table.limit_solref:
+            joint.solref_limit = np.asarray(table.limit_solref[joint.name], float)
+        if joint.name in table.limit_solimp:
+            joint.solimp_limit = np.asarray(table.limit_solimp[joint.name], float)
     if table.colliders:
         _replace_colliders(spec, table.colliders, table.self_collision)
     if table.neck:
@@ -661,6 +899,78 @@ def her_surface_lengths(t: dict[str, np.ndarray]) -> dict[str, float]:
     return out
 
 
+def muscle_length_ratios(
+    table: SubjectTable, finger_flexors: bool = False, n_poses: int = 400
+) -> dict[str, float]:
+    """Musculotendon-length ratio (scaled / stock geometry) of every muscle.
+
+    Measured over random poses of the stock model; ``lengthrange`` times the ratio keeps
+    each muscle's calibration (optimal fibre and tendon slack length) in normalised units.
+
+    Args:
+        table: Subject table (only its geometry is used).
+        finger_flexors: Include the extrinsic finger flexors (:data:`FINGER_FLEXORS`).
+        n_poses: Number of random poses.
+    """
+    model = compile_spec(base_fullbody_spec(finger_flexors))
+    geo_spec = base_fullbody_spec(finger_flexors)
+    _scale_geometry(geo_spec, compile_spec(geo_spec.copy()), table)
+    scaled = compile_spec(geo_spec)
+    poses = sample_poses(model, n_poses)
+    L0, L1 = actuator_lengths(model, poses), actuator_lengths(scaled, poses)
+    ratio = (L0 * L1).sum(0) / (L0 * L0).sum(0)
+    return {
+        model.actuator(i).name: float(ratio[i])
+        for i in range(model.nu)
+        if model.actuator_dyntype[i] == mujoco.mjtDyn.mjDYN_MUSCLE
+    }
+
+
+def upgrade_table(
+    table: SubjectTable,
+    wrist_extension_deg: float = R3_WRIST_EXTENSION_DEG,
+    undo_shoulder_edit: bool = False,
+    n_poses: int = 400,
+) -> SubjectTable:
+    """The round-3 plant: the hand and wrist fixes of the strength audit.
+
+    See ``notes/muscle_yoga/strength_audit.md`` §9: extrinsic finger flexors kept (their
+    ``lengthrange`` scaled like every other muscle's), wrist paths repaired beyond ±45°,
+    wrist extension opened to *wrist_extension_deg*, stiff wrist and elbow end-ranges, and
+    the supraspinatus' active force restored. Passive compliance is not refitted here: run
+    ``statics --write-compliant`` on clips retargeted to the new body.
+
+    Args:
+        table: The table to upgrade.
+        wrist_extension_deg: Wrist extension limit (deg).
+        undo_shoulder_edit: Also restore TMIN, TMAJ, INFSP and LAT2 to their MoBL-ARMS
+            forces (:data:`SHOULDER_EDIT_UNDO`).
+        n_poses: Random poses for the finger flexors' length ratios.
+    """
+    ratio = muscle_length_ratios(table, finger_flexors=True, n_poses=n_poses)
+    stock = compile_spec(base_fullbody_spec(finger_flexors=True))
+    lengthrange = dict(table.lengthrange)
+    for name in (_arm_name(k, s) for k in FINGER_FLEXORS for s in SIDES):
+        lengthrange[name] = (
+            stock.actuator_lengthrange[stock.actuator(name).id] * ratio[name]
+        ).tolist()
+    ranges = dict(table.joint_ranges)
+    for s in SIDES:
+        ranges[f"flexion_{s}"] = [
+            -float(np.radians(wrist_extension_deg)),
+            float(ranges[f"flexion_{s}"][1]),
+        ]
+    stiff = [f"{j}_{s}" for j in ("flexion", "elbow_flex") for s in SIDES]
+    factors = {**SUPSP_FIX, **(SHOULDER_EDIT_UNDO if undo_shoulder_edit else {})}
+    return replace(
+        table, finger_flexors=True, lengthrange=lengthrange, joint_ranges=ranges,
+        wrist_obstacles={k: list(v) for k, v in WRIST_OBSTACLES.items()},
+        limit_solref={j: list(STIFF_LIMIT_SOLREF) for j in stiff},
+        limit_solimp={j: list(STIFF_LIMIT_SOLIMP) for j in stiff},
+        strength_scale={_arm_name(k, s): v for k, v in factors.items() for s in SIDES},
+    )  # fmt: skip
+
+
 def fit_subject_table(
     plant_xml: Path,
     mosh_pkl: Path,
@@ -732,19 +1042,10 @@ def fit_subject_table(
         joint_ranges={k: list(np.radians(v)) for k, v in YOGA_RANGES_DEG.items()},
         coupling_extension={f"knee_angle_{s}": float(np.radians(KNEE_COUPLING_FIT_DEG)) for s in SIDES},
     )  # fmt: skip
-    # Muscles: ratio of musculotendon lengths over random poses of the geometry-scaled model.
-    geo_spec = base_fullbody_spec()
-    m_geo = compile_spec(geo_spec.copy())
-    _scale_geometry(geo_spec, m_geo, table)
-    scaled = compile_spec(geo_spec)
-    poses = sample_poses(model, n_poses)
-    L0 = actuator_lengths(model, poses)
-    L1 = actuator_lengths(scaled, poses)
-    ratio = (L0 * L1).sum(0) / (L0 * L0).sum(0)
+    ratio = muscle_length_ratios(table, n_poses=n_poses)
     table.lengthrange = {
-        model.actuator(i).name: (model.actuator_lengthrange[i] * ratio[i]).tolist()
-        for i in range(model.nu)
-        if model.actuator_dyntype[i] == mujoco.mjtDyn.mjDYN_MUSCLE
+        n: (model.actuator_lengthrange[model.actuator(n).id] * r).tolist()
+        for n, r in ratio.items()
     }
     base_group: dict[str, float] = {}
     for b in range(1, model.nbody):
@@ -756,7 +1057,7 @@ def fit_subject_table(
         "her_group_mass_kg": group_mass, "myo_group_mass_kg": base_group,
         "myo_crown_above_gh_m": crown_myo, "her_crown_above_gh_m": crown_myo + head_lift,
         "her_stature_m": float(her_t["crown"][2] - her_t["sole"][2]),
-        "muscle_length_ratio": {"min": float(ratio.min()), "median": float(np.median(ratio)), "max": float(ratio.max())},
+        "muscle_length_ratio": {"min": float(min(ratio.values())), "median": float(np.median(list(ratio.values()))), "max": float(max(ratio.values()))},
     }  # fmt: skip
     return table
 
@@ -779,16 +1080,20 @@ def _plant_rest_from_joints(J: np.ndarray) -> np.ndarray:
 
 
 def main() -> None:
-    """Fit the subject table, write it and print the audit."""
+    """Fit the subject table (or upgrade one), write it and print the audit."""
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("--plant-xml", type=Path, required=True)
-    ap.add_argument(
-        "--mosh-pkl", type=Path, required=True, help="any of her MoSh++ stage-II fits"
-    )
-    ap.add_argument("--smplx", type=Path, required=True, help="SMPLX_FEMALE.npz")
+    ap.add_argument("--plant-xml", type=Path)
+    ap.add_argument("--mosh-pkl", type=Path, help="any of her MoSh++ stage-II fits")
+    ap.add_argument("--smplx", type=Path, help="SMPLX_FEMALE.npz")
     ap.add_argument("--out", type=Path, required=True, help="subject table JSON")
+    ap.add_argument(
+        "--upgrade", type=Path, default=None,
+        help="instead of fitting: write this table upgraded to the round-3 plant (upgrade_table)",
+    )  # fmt: skip
+    ap.add_argument("--wrist-extension-deg", type=float, default=R3_WRIST_EXTENSION_DEG)
+    ap.add_argument("--undo-shoulder-edit", action="store_true")
     ap.add_argument("--no-neck", action="store_true")
     ap.add_argument(
         "--keep-myo-colliders",
@@ -804,6 +1109,19 @@ def main() -> None:
         "--xml-out", type=Path, default=None, help="also write the compiled model XML"
     )
     args = ap.parse_args()
+    if args.upgrade is not None:
+        table = upgrade_table(
+            SubjectTable.load(args.upgrade),
+            args.wrist_extension_deg,
+            args.undo_shoulder_edit,
+        )
+        table.save(args.out)
+        model = compile_spec(build_subject_spec(table))
+        print(f"wrote {args.out}: {sum(model.actuator_dyntype == mujoco.mjtDyn.mjDYN_MUSCLE)} muscles, "
+              f"strength_scale {table.strength_scale}, stiff limits {sorted(table.limit_solref)}")  # fmt: skip
+        return
+    if None in (args.plant_xml, args.mosh_pkl, args.smplx):
+        ap.error("--plant-xml, --mosh-pkl and --smplx are required to fit a table")
     table = fit_subject_table(
         args.plant_xml, args.mosh_pkl, args.smplx, neck=not args.no_neck
     )

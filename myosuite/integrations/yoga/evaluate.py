@@ -18,7 +18,10 @@ muscle sigmoid flattened so that each excitation equals its expectation under th
 training noise (``matched``, see :func:`noise_matched_action`). ``--repeats``
 plays every clip that many times and averages. Writes per-clip survival and
 tracking error, and renders videos of the first replica with the reference drawn
-as a ghost.
+as a ghost. ``--record-state`` also saves, per rendered clip, the replica's
+``qpos/qvel/act/ctrl/qacc/actuator_force`` at every control step (``<clip>.state.npz``,
+read before the step, so ``ctrl`` is the previous step's) and the env's compiled model
+(``model.mjb``), for offline dynamics (:mod:`myosuite.integrations.yoga.dynamics_viz`).
 
 CLI::
 
@@ -36,6 +39,9 @@ from typing import Any
 import numpy as np
 
 from myosuite.core.trajectory_io import MotionClip
+
+# Per-step state saved by ``--record-state`` (besides ``qpos``), read before each step.
+STATE_KEYS = ("qvel", "act", "ctrl", "qacc", "actuator_force")
 
 
 def _force_starts(
@@ -75,6 +81,20 @@ def _force_starts(
     ent.write_joint_state_to_sim(q[:, 7:], v[:, 6:], env_ids=ids)
     env.sim.forward()
     cache["synced_inputs"] = None
+
+
+def run_task_kwargs(cfg_json: dict) -> dict:
+    """Task settings of a run from its ``config.json`` (action space and coordination)."""
+    out: dict = {}
+    args = cfg_json.get("args", {})
+    if "effort_weight" in args:
+        out["effort_weight"] = float(args["effort_weight"])
+    coord = cfg_json.get("coord")
+    if coord:
+        from myosuite.integrations.yoga.coordination import CoordinationCfg
+
+        out.update(action_space="joint", coord=CoordinationCfg(**coord))
+    return out
 
 
 def hold_start(clip: MotionClip, lo: float = 0.2, hi: float = 0.8) -> int:
@@ -163,6 +183,7 @@ def rollout(
     include: list[str] | None = None,
     at_s: float | None = None,
     sweep_step_s: float = 2.0,
+    record_state: bool = False,
 ) -> dict:
     """Play every clip from frame 0 (``start="first"``), from its quietest mid-clip
     frame (``"hold"``), frozen at that frame (``"frozen"``) or from every multiple of
@@ -175,7 +196,8 @@ def rollout(
     replicas. ``action`` is ``"mean"``, ``"sampled"`` or ``"matched"`` (module
     docstring). Returns per clip the qpos trace of its first replica (of its longest-
     surviving one with ``best_trace``), start frames and per-clip
-    metrics."""
+    metrics. ``record_state`` adds ``states`` (per clip, the same replica's
+    :data:`STATE_KEYS` traces) and ``mj_model`` (the env's compiled model)."""
     import torch
     from mjlab.envs import ManagerBasedRlEnv
     from mjlab.rl import MjlabOnPolicyRunner, RslRlVecEnvWrapper
@@ -200,6 +222,11 @@ def rollout(
     )
 
     cfg_json = json.loads((run / "config.json").read_text())
+    task_kw = run_task_kwargs(cfg_json)
+    if action == "matched" and task_kw.get("action_space") == "joint":
+        raise ValueError(
+            "the noise-matched controller applies to the muscle action space only"
+        )
     hold_frames: list[int] = []
 
     def hold_frame(clip: MotionClip) -> int:
@@ -222,6 +249,7 @@ def rollout(
         max_site_err=max_site_err,
         include=include,
         clip_fn=prepare if start in ("frozen", "sweep") else None,
+        **task_kw,
     )
     names = clip_names(clips)
     n = len(clips)
@@ -231,7 +259,11 @@ def rollout(
     env_cfg.scene.num_envs = n_envs
     env = ManagerBasedRlEnv(cfg=env_cfg, device="cuda")
     wrapped = RslRlVecEnvWrapper(env)
-    n_muscles = env.action_manager.get_term("muscles").action_dim
+    n_muscles = (
+        env.action_manager.get_term("muscles").action_dim
+        if "muscles" in env.action_manager.active_terms
+        else 0
+    )
     runner = MjlabOnPolicyRunner(
         env=wrapped, train_cfg=cfg_json["runner"], log_dir=None, device="cuda"
     )
@@ -251,6 +283,7 @@ def rollout(
     survived = np.zeros(n_envs, int)
     err_sum = np.zeros(n_envs)
     traces = [[] for _ in range(n_envs)]
+    states = [{k: [] for k in STATE_KEYS} for _ in range(n_envs)]
     # Termination margins at the last surviving step: worst site / max_site_err, mean site
     # error / MEAN_SITE_TERMINATION_M, root error / ROOT_TERMINATION_M. The largest names
     # the rule that ended the episode one control step later.
@@ -265,8 +298,15 @@ def rollout(
     with torch.inference_mode():
         for t in range(int(lengths.max()) - 1):
             qpos = ent.data.data.qpos.cpu().numpy()
+            extra = (
+                {k: getattr(ent.data.data, k).cpu().numpy() for k in STATE_KEYS}
+                if record_state
+                else {}
+            )
             for i in np.nonzero(alive)[0]:
                 traces[i].append(qpos[i].copy())
+                for k, v in extra.items():
+                    states[i][k].append(v[i].copy())
             if action == "matched":
                 act = noise_matched_action(policy, obs, n_muscles)
             else:
@@ -334,6 +374,7 @@ def rollout(
                 key = ("mean", "root")[rule - 1]
             causes[key] = causes.get(key, 0) + 1
         metrics[name]["end_causes"] = causes
+    mj_model = env.sim.mj_model if record_state else None
     env.close()
     chosen = [
         int(np.flatnonzero(clip_of == i)[np.argmax(survived[clip_of == i])])
@@ -341,13 +382,19 @@ def rollout(
         else i
         for i in range(n)
     ]
-    return {
+    out = {
         "names": names,
         "traces": [np.asarray(traces[e]) for e in chosen],
         "trace_replicas": [int(e // n) for e in chosen],
         "offsets": reported_starts,
         "metrics": metrics,
     }
+    if record_state:
+        out["states"] = [
+            {k: np.asarray(v) for k, v in states[e].items()} for e in chosen
+        ]
+        out["mj_model"] = mj_model
+    return out
 
 
 def main() -> None:
@@ -392,6 +439,11 @@ def main() -> None:
         action="store_true",
         help="render each clip's longest-surviving replica instead of the first",
     )
+    ap.add_argument(
+        "--record-state",
+        action="store_true",
+        help="save each rendered replica's state per step and the env's model",
+    )
     args = ap.parse_args()
     cfg = json.loads((args.run / "config.json").read_text())["args"]
     table, clips_dir = Path(cfg["table"]), Path(cfg["clips_dir"])
@@ -399,7 +451,7 @@ def main() -> None:
         args.run, args.checkpoint, table, clips_dir, float(cfg.get("max_site_err", 0.5)),
         start=args.start, horizon_s=args.horizon_s, action=args.action, repeats=args.repeats,
         best_trace=args.render_best, include=args.include, at_s=args.at_s,
-        sweep_step_s=args.sweep_step_s,
+        sweep_step_s=args.sweep_step_s, record_state=args.record_state,
     )  # fmt: skip
     args.out.mkdir(parents=True, exist_ok=True)
     m = res["metrics"]
@@ -433,7 +485,13 @@ def main() -> None:
             if args.render_best and args.repeats > 1
             else ""
         )
-        for name, tr, off in zip(res["names"], res["traces"], res["offsets"]):
+        if args.record_state:
+            import mujoco
+
+            mujoco.mj_saveModel(res["mj_model"], str(args.out / "model.mjb"), None)
+        for i, (name, tr, off) in enumerate(
+            zip(res["names"], res["traces"], res["offsets"])
+        ):
             if not any(s in name for s in args.render) or len(tr) < 10:
                 continue
             base, at = name.rsplit("@", 1) if args.start == "sweep" else (name, None)
@@ -443,6 +501,9 @@ def main() -> None:
             if args.start == "frozen":
                 ref, start_s = frozen_reference(ref, start_s, len(tr) / 100.0), 0.0
             np.save(args.out / f"{name}.qpos.npy", tr)  # the rendered trace, 100 Hz
+            if args.record_state:
+                np.savez(args.out / f"{name}.state.npz", qpos=tr, start_s=start_s,
+                         hz=100.0, **res["states"][i])  # fmt: skip
             render_retarget(model, tr, 100.0, ref, cols, args.out / f"{name}.mp4",
                             title=f"policy {args.checkpoint.stem}: {name}{note}", start_s=start_s)  # fmt: skip
 

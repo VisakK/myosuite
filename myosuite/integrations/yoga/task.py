@@ -85,6 +85,9 @@ def yoga_env_cfg(
     effort_weight: float = 1.0,
     max_site_err: float = 0.5,
     mimic_reward_weight: float = 5.0,
+    action_space: str = "muscle",
+    coord: Any = None,
+    feedforward: list[np.ndarray] | None = None,
 ) -> Any:
     """The yoga tracking task as a :class:`mjlab.envs.ManagerBasedRlEnvCfg`.
 
@@ -96,10 +99,22 @@ def yoga_env_cfg(
         effort_weight: Weight of the mean squared activation penalty per step.
         max_site_err: Per-site deviation (m) that ends an episode.
         mimic_reward_weight: Weight of the DeepMimic composite reward per step.
+        action_space: ``"muscle"``: one excitation per muscle plus the neck torques (the
+            original task). ``"joint"``: PD targets (offsets from the reference) and
+            co-contraction levels through the muscle coordination layer
+            (:mod:`.coordination`).
+        coord: :class:`~.coordination.CoordinationCfg` for ``"joint"`` (default settings
+            when ``None``).
+        feedforward: For ``"joint"``: per clip, the static feed-forward hinge torques
+            (:func:`~.feedforward.bank_feedforward`).
 
     Returns:
         The environment config.
     """
+    if action_space not in ("muscle", "joint"):
+        raise ValueError(
+            f"action_space must be 'muscle' or 'joint', got {action_space!r}"
+        )
     from mjlab.actuator import XmlActuatorCfg
     from mjlab.actuator.actuator import TransmissionType
     from mjlab.envs.mdp.actions import JointEffortActionCfg
@@ -136,6 +151,26 @@ def yoga_env_cfg(
         cfg.actions["neck"] = JointEffortActionCfg(
             entity_name=ENTITY, actuator_names=sb.NECK_JOINTS, scale=1.0
         )
+    if action_space == "joint":
+        from myosuite.integrations.yoga.coordination import (
+            CoordinatedMuscleActionCfg,
+            CoordinationCfg,
+        )
+
+        if not table.neck:
+            raise ValueError(
+                "the joint action space drives the neck motors: table.neck"
+            )
+        cfg.actions = {
+            "joint_pd": CoordinatedMuscleActionCfg(
+                entity_name=ENTITY,
+                mj_model=mj,
+                coord=coord or CoordinationCfg(),
+                clips=clips,
+                ctrl_dt=CTRL_DT,
+                feedforward=feedforward,
+            )  # fmt: skip
+        }
     # mjlab multiplies reward terms by ctrl_dt; divide so the weight is per step.
     cfg.rewards["effort"] = RewardTermCfg(
         func=_muscle_effort(ENTITY, len(muscles)), weight=-effort_weight / CTRL_DT
@@ -149,6 +184,8 @@ def yoga_runner_cfg(
     desired_kl: float = 0.3,
     max_std: float | None = None,
     entropy_coef: float = 0.001,
+    num_learning_epochs: int = 4,
+    num_mini_batches: int = 4,
     **kwargs: Any,
 ) -> Any:
     """rsl_rl PPO settings for the yoga bank (wider nets than the single-clip default).
@@ -181,7 +218,7 @@ def yoga_runner_cfg(
         distribution_cfg=None,
     )
     algorithm = RslRlPpoAlgorithmCfg(
-        num_learning_epochs=4, num_mini_batches=4, learning_rate=3e-4, schedule="adaptive", desired_kl=desired_kl,
+        num_learning_epochs=num_learning_epochs, num_mini_batches=num_mini_batches, learning_rate=3e-4, schedule="adaptive", desired_kl=desired_kl,
         entropy_coef=entropy_coef, clip_param=0.2, value_loss_coef=1.0, gamma=0.99, lam=0.95, max_grad_norm=1.0,
         normalize_advantage_per_mini_batch=False, use_clipped_value_loss=True,
     )  # fmt: skip
@@ -273,9 +310,26 @@ def register_yoga_task(
 
     table = sb.SubjectTable.load(table_path)
     model = sb.compile_spec(sb.build_subject_spec(table), SIM_DT)
-    clips = load_yoga_clips(clips_dir, model, include, exclude)
-    if clip_fn is not None:
-        clips = clip_fn(clips)
+    sources = load_yoga_clips(clips_dir, model, include, exclude)
+    clips = clip_fn(sources) if clip_fn is not None else sources
+    coord = cfg_kwargs.get("coord")
+    if (
+        cfg_kwargs.get("action_space") == "joint"
+        and "feedforward" not in cfg_kwargs
+        and (coord is None or coord.ff_scale != 0.0 or coord.gain_mode != "teacher")
+    ):
+        from myosuite.integrations.yoga.feedforward import (
+            bank_feedforward,
+            coord_options,
+        )
+
+        cfg_kwargs["feedforward"] = bank_feedforward(
+            Path(table_path),
+            sources,
+            clips,
+            Path(clips_dir).parent / "feedforward",
+            **coord_options(coord),
+        )
     _register_or_replace_mjlab_task(
         register_mjlab_task, task_id=TASK_ID,
         env_cfg=yoga_env_cfg(table, clips, num_envs, **cfg_kwargs),

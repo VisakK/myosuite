@@ -15,9 +15,15 @@ The motion data (MOYO capture, AMASS-licensed SMPL-X fits) is not redistributabl
 written inside this package; generated data lives in a directory you choose (below:
 `$Y = /home/visakii/Documents/MovementGym/yoga_muscle`).
 
-**Status (2026-11-04): closed.** All runs are stopped. The consolidated record, including why
-this approach stalls and the directions that would change it, is
-`<ProtoMotions>/expert_revist/muscle_teacher_myosuite_2026_11/README.MD`.
+**Status (2026-11-09): round 2 stopped; the handstand is blocked by the plant.**
+* **Round 1** (muscle-level actions, §1-§7) is closed. Its record, including why that approach stalls,
+  is `notes/muscle_yoga/round1_record.md` at the repository root.
+* **Round 2** (§8) gives the policy the PD teacher's joint-space action space and does the muscle
+  sharing in a GPU muscle coordination layer.
+  * Its plan is `notes/muscle_yoga/round2_plan.md`.
+  * The session write-up is `notes/muscle_yoga/round2_writeup.md`, with code pointers, commands, results
+    and the diagnosis of why the handstand cannot be held.
+* Start at `notes/muscle_yoga/README.md`.
 
 ## 1. Short answer
 
@@ -602,3 +608,112 @@ velocity map, identity table, segment scaling, passive scaling, self-collision, 
 points vs MuJoCo, per-site termination, the noise-matched controller against Monte Carlo, the
 pelvis-frame split of termination causes, and the start-time sweep's cuts). The full tier-1 suite (1426 tests), the mimic and the
 mjlab mimic suites pass with the shared-code changes.
+
+## 8. Round 2: joint-space actions through a muscle coordination layer (2026-11-08)
+
+The policy acts in the PD teacher's action space: per independent hinge, a target offset from
+the reference one step ahead and a torque residual, plus a co-contraction level per limb (73
+actions instead of 357). A fixed layer turns them into the 354 excitations at every 2 ms physics
+substep, for all environments in one batch:
+
+1. **Demand.** Static feed-forward (the statics LP solved at every reference frame), plus a PD
+   law whose gains are the teacher's, capped by muscle capacity and by what the activation lag
+   can stabilise for the hinge's joint-space inertia, plus the reference's acceleration.
+2. **Muscle sharing.** Static optimisation of the muscle activations under the exact muscle
+   force-length-velocity model and moment arms (MuJoCo-Warp's tendon Jacobian, the joint
+   couplings), by batched Cholesky with active-set passes.
+3. **Excitation.** Inverse activation dynamics.
+
+| module | role |
+|---|---|
+| `coordination.py` | the layer (`CoordinationCfg`, `CoordinatedMuscleAction`) and its torch functions: muscle gain/bias, projected muscle matrix, static optimisation, excitation |
+| `feedforward.py` | per-frame static feed-forward torques and joint-space inertia (CLI; cached in `$Y/feedforward/`) |
+| `train_eval.py` | in-training evaluation (frozen holds, start sweep, mean action) logged to the training logger |
+| `task.py` | `yoga_env_cfg(action_space="joint", coord=...)` |
+| `train.py` | `--action-space joint` and the layer's flags, `--logger wandb`, `--eval-interval` |
+| `evaluate.py` | rebuilds a run's action space from its `config.json` |
+
+Measured while building it (zero action, frozen poses):
+* **The teacher's gains ring behind the activation lag.** PhysX integrates its PD implicitly.
+* **A PD law without feed-forward does not hold a closed-chain pose.** The weak hinges
+  saturate: hip rotation gives ~25 N m in the one-leg dog, the wrist ~9 N m.
+* **The lag-bounded gains give the healthiest loop.** Zero action then lasts 1-2.5 s; the
+  failures are balance (whole-body tipping), not posture.
+
+The layer's math matches MuJoCo exactly. Four of these checks are tests in
+`myosuite/tests/test_yoga_integration.py`.
+
+```bash
+# feed-forward tables (also computed on demand by register_yoga_task)
+python -m myosuite.integrations.yoga.feedforward --table $Y/model/subject_table_compliant_selfcol.json \
+    --clips-dir $Y/clips --include Handstand --workers 16                                            # ~10 s
+python -m myosuite.integrations.yoga.train --table $Y/model/subject_table_compliant_selfcol.json --clips-dir $Y/clips \
+    --log-dir $Y/runs/handstand_v2_mcl --num-envs 4096 --iterations 20000 --save-interval 50 \
+    --include 220923_Handstand_pose_or_Adho_Mukha_Vrksasana_-a --action-space joint --gain-mode bounded \
+    --omega-max 80 --dq-scale 0.2 --tau-res-scale 0.2 --init-std 0.2 --max-std 0.5 --entropy-coef 0 \
+    --desired-kl 0.05 --logger wandb --wandb-project yoga_muscle --eval-interval 50 --eval-frozen-s 19.88 38.57
+TRAIN_PID=<pid> $Y/tools/watch_handstand_v2.sh   # videos of the newest checkpoint every 90 min, to W&B
+```
+
+
+## 9. Round 3: the plant fixes of the strength audit (2026-11-09)
+
+The strength audit (`notes/muscle_yoga/strength_audit.md`) found the body stronger than a
+typical woman of her size almost everywhere. The handstand's deficit was local to the hand
+and wrist, and geometric. Round 3 fixes it in the audit's order. Every fix is a
+`SubjectTable` field whose default reproduces the old body, so old tables, clips and
+checkpoints are unchanged. `subject_body.upgrade_table` (CLI `--upgrade`) writes the
+round-3 table.
+
+| fix | mechanism | where |
+|---|---|---|
+| wrist paths beyond MyoArm's ±45° | a cylinder on the flexion axis per wrist muscle; the tendon wraps around it on its anatomical side when it would pass closer to the axis (radii = measured moment arms, Garland 2018 / Gonzalez 1997) | `wrist_obstacles`, `_repair_wrist_paths`, `WRIST_OBSTACLES` |
+| extrinsic finger flexors | FDS2-5, FDP2-5, FPL kept with the finger joints welded straight (18 muscles); `lengthrange` scaled like the others | `finger_flexors`, `base_fullbody_spec(finger_flexors=True)`, `muscle_length_ratios` |
+| stiff wrist and elbow end-ranges | per-joint limit `solref`/`solimp` (~6x MuJoCo's default under the handstand load) | `limit_solref`, `limit_solimp`, `STIFF_LIMIT_*` |
+| wrist extension to 110° | her clips need at least 100° (the range audit's box) | `upgrade_table(wrist_extension_deg)` |
+| supraspinatus active force 339 → 497 N | `gainprm[2]` held the supinator's value | `strength_scale`, `SUPSP_FIX` |
+| seated hands, locked elbows | retarget: the four bottom corners of a supporting palm/finger box are pulled onto the floor; supporting elbows flexed < 15° are locked straight | `retarget --split-hand-contacts --lock-elbows 15` |
+| honest feed-forward | LP limit reactions only on stiff end-ranges; contact-aware ("planted") hinge inertia for the gain cap | `CoordinationCfg.ff_limits`, `.planted_inertia`; `train --ff-limits stiff --planted-inertia` |
+
+The doubled TMIN/TMAJ/INFSP and LAT2 ×1.69 (an undocumented MyoArm edit) were kept.
+Restoring the MoBL-ARMS forces (`--undo-shoulder-edit`) costs two arm-balance holds and
+raises s* of the crow family by 25-30 %, with no effect on the handstand.
+
+Verified:
+* Wrist moment arms out to −110°: flexors 1.0-1.4 cm, extensors stay extensors. Inside ±45°
+  they change by ≤ 0.37 cm; FCU, PL and the finger flexors not at all.
+* Wrist flexion capacity at the handstand frame: 8.7 N m (half of it an artefact) → 28.3 N m.
+* Hands at the handstand holds: tilt within ±0.8°, fingertips ≤ 0.14 cm off the floor (were
+  2-3° and 0.4-0.7 cm). Retarget over 56 clips: joint-centre median 1.01 → 1.07 cm.
+* Statics, 270 holds: **235 holdable**, every one without free limit torque (old body: 224
+  with it, 223 without). Handstand at 19.88 s: s* 1.81 → **0.66**; at 38.57 s: 3.33 → **0.88**.
+* Five new data-free tests (20 in total pass).
+
+```bash
+python -m myosuite.integrations.yoga.subject_body --upgrade $Y/model/subject_table_compliant_selfcol.json \
+    --out $Y/clips_r3/retarget_table.json
+OMP_NUM_THREADS=1 python -m myosuite.integrations.yoga.retarget --table $Y/clips_r3/retarget_table.json \
+    --mosh-pkl "$PKL" --smplx $SMPLX --plant-xml $PLANT --refs $Y/refs --out $Y/clips_r3 --workers 16 \
+    --split-hand-contacts --lock-elbows 15                                                      # ~5 min
+python -m myosuite.integrations.yoga.statics --table $Y/clips_r3/retarget_table.json --clips-dir $Y/clips_r3 \
+    --holds $REL/release_holds.yaml --out $Y/model/statics_r3.json --workers 16 \
+    --write-compliant $Y/model/subject_table_r3.json                    # her flexibility on the new body, ~20 s
+```
+
+Dynamics on the round-3 body (zero action, `$Y/tools/diag_frozen.py`):
+
+| test | old body | round 3, `--ff-limits stiff` | round 3 + `--planted-inertia` |
+|---|---|---|---|
+| frozen handstand 19.88 s (8 replicas) | 1.11 s | **1.80 s** | 1.35 s |
+| frozen handstand 38.57 s | 1.08 s | **1.49 s** | 1.23 s |
+| 10 s from every 2 s of the clip (mean) | 1.04 s | **1.26 s** | 0.68 s |
+
+* **The posture holds instead of collapsing.** At 1 s the COM has drifted 3.7 cm, against
+  19.5 cm on the old body, and the elbows stay locked.
+* **Planted inertia hurts.** Its large damping and acceleration terms amplify noise, so it is
+  left off. Train with round 2's flags plus `--ff-limits stiff` on `subject_table_r3.json`
+  and `$Y/clips_r3`.
+* **Old checkpoints do not load.** The observation grows to 1182-d (18 more activations); the
+  action stays 73-d.
+
+The full record is `notes/muscle_yoga/round3_plant_fixes.md`.

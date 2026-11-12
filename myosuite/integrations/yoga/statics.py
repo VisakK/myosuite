@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Collection
 from pathlib import Path
 
 import mujoco
@@ -73,22 +74,34 @@ def hold_statics(
     mu: float = 0.8,
     margin: float = 0.01,
     limit_tol: float = np.radians(0.5),
-    use_limits: bool = True,
+    use_limits: bool | Collection[str] = True,
     return_solution: bool = False,
     passive_scale: float = 1.0,
     braces: bool = True,
     brace_margin: float = 0.01,
+    qvel: np.ndarray | None = None,
+    qacc: np.ndarray | None = None,
 ) -> dict:
-    """Minimum peak activation that holds ``q`` statically (see module docstring)."""
+    """Minimum peak activation that holds ``q`` statically (see module docstring).
+
+    ``use_limits``: ``True`` lets every hinge at a range limit take a free, rigid limit
+    reaction; a collection of joint names restricts that to those joints (e.g. the ones
+    with a stiff end-range, ``SubjectTable.limit_solref``); ``False`` allows none.
+
+    ``qvel`` / ``qacc`` make it the dynamic version: the load gains ``M(q) qacc`` and the
+    velocity terms, and the muscles act at their shortening velocity (force-velocity).
+    """
     from scipy.optimize import linprog
 
     d = mujoco.MjData(model)
     d.qpos[:] = q
+    if qvel is not None:
+        d.qvel[:] = qvel
     mujoco.mj_forward(model, d)
     T = rk.velocity_map(q)
     mus = np.nonzero(model.actuator_dyntype == mujoco.mjtDyn.mjDYN_MUSCLE)[0]
     gain = np.array([
-        mujoco.mju_muscleGain(d.actuator_length[i], 0.0, model.actuator_lengthrange[i], model.actuator_acc0[i], model.actuator_gainprm[i, :9])
+        mujoco.mju_muscleGain(d.actuator_length[i], d.actuator_velocity[i], model.actuator_lengthrange[i], model.actuator_acc0[i], model.actuator_gainprm[i, :9])
         for i in mus
     ])  # fmt: skip
     bias = np.array([
@@ -147,6 +160,11 @@ def hold_statics(
             rk.indep_hinge_lo,
             rk.indep_hinge_hi,
         ):
+            if (
+                use_limits is not True
+                and model.joint(int(model.dof_jntid[dof])).name not in use_limits
+            ):
+                continue
             for bound, sign in ((lo, 1.0), (hi, -1.0)):
                 if abs(q[adr] - bound) < limit_tol:
                     e = np.zeros(model.nv)
@@ -156,7 +174,12 @@ def hold_statics(
             cols.append(T.T @ np.array(L).T)
             n_lim = len(L)
     A = np.hstack(cols)
-    rhs = T.T @ (d.qfrc_bias - d.qfrc_passive - Mm.T @ bias)
+    load = d.qfrc_bias - d.qfrc_passive - Mm.T @ bias
+    if qacc is not None:
+        inertial = np.zeros(model.nv)
+        mujoco.mj_mulM(model, d, inertial, np.asarray(qacc, dtype=float))
+        load = load + inertial
+    rhs = T.T @ load
     n_a, n_x = len(mus), A.shape[1]
     A_eq = np.hstack([A, np.zeros((A.shape[0], 1))])
     A_ub = np.hstack([np.eye(n_a), np.zeros((n_a, n_x - n_a)), -np.ones((n_a, 1))])
@@ -255,9 +278,8 @@ def fit_passive_compliance(
 
 def _job(args: tuple) -> list[dict]:
     table_path, clips_dir, holds, margin = args
-    model = sb.compile_spec(
-        sb.build_subject_spec(sb.SubjectTable.load(Path(table_path)))
-    )
+    table = sb.SubjectTable.load(Path(table_path))
+    model = sb.compile_spec(sb.build_subject_spec(table))
     model.geom_margin[:] = (
         margin  # supports within this of the floor count (the plant LP used 2 cm)
     )
@@ -277,6 +299,10 @@ def _job(args: tuple) -> list[dict]:
         r["s_star_no_passive"] = hold_statics(
             model, rk, q, margin=margin, passive_scale=0.0
         )["s_star"]
+        if table.limit_solref:
+            r["s_star_stiff_limits"] = hold_statics(
+                model, rk, q, margin=margin, use_limits=set(table.limit_solref)
+            )["s_star"]
         out.append(r)
     return out
 
@@ -337,6 +363,18 @@ def main() -> None:
     print(f"holds {len(res)}: no static equilibrium {np.isinf(s).sum()}, muscles saturate (s*>1) {((s > 1) & np.isfinite(s)).sum()}, "
           f"holdable {(s <= 1).sum()} (without joint-limit reactions {(s_nl <= 1).sum()}; "
           f"without passive muscle force {(s_np <= 1).sum()})")  # fmt: skip
+    if "s_star_stiff_limits" in res[0]:
+        s_st = np.array(
+            [
+                r["s_star_stiff_limits"]
+                if r["s_star_stiff_limits"] is not None
+                else np.inf
+                for r in res
+            ]
+        )
+        print(
+            f"  with limit reactions only on the stiff end-ranges: holdable {(s_st <= 1).sum()}"
+        )
     by_group: dict[str, list[float]] = {}
     for r, v in zip(res, s):
         by_group.setdefault(r["group"], []).append(v)
