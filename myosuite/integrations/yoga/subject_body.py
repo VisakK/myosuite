@@ -110,6 +110,10 @@ SHOULDER_EDIT_UNDO: dict[str, float] = {
 # Wrist extension (deg) the round-3 plant allows: her clips need at least 100 deg (the range
 # audit's box), and a flat hand on the floor needs the hand seated past MyoArm's 45 deg.
 R3_WRIST_EXTENSION_DEG = 110.0
+# Round-4 mass placement (m forward). MyoFullBody keeps the thorax and head mass on the spine
+# line; her pressure-mat COP in static holds puts it ~3 cm in front
+# (notes/muscle_yoga/com_vs_pressure_mat.md).
+R4_COM_FORWARD: dict[str, float] = {"torso": 0.03, "head": 0.03}
 
 # Plant body groups whose masses define each MyoFullBody mass group.
 PLANT_MASS_GROUPS: dict[str, tuple[str, ...]] = {
@@ -322,6 +326,8 @@ class SubjectTable:
             soft limit, whose stiffness scales with a light distal segment's inertia.
         strength_scale: Muscle name -> factor on the active peak force F0
             (``gainprm[2]``); the passive force (``biasprm``) keeps its fitted value.
+        com_forward: Body name -> metres its centre of mass is moved to the front
+            (anterior at the rest pose). Mass and inertia about the centre are unchanged.
         colliders: Floor-contact primitives replacing MyoFullBody's own colliders
             (which stay as visual geoms): ``{body, type, size, pos, quat}`` in the
             MyoFullBody body frame. Filled by
@@ -350,6 +356,7 @@ class SubjectTable:
     limit_solref: dict[str, list[float]] = field(default_factory=dict)
     limit_solimp: dict[str, list[float]] = field(default_factory=dict)
     strength_scale: dict[str, float] = field(default_factory=dict)
+    com_forward: dict[str, float] = field(default_factory=dict)
 
     def save(self, path: Path) -> None:
         """Write as JSON."""
@@ -574,6 +581,17 @@ def _scale_masses(
             body.inertia = np.asarray(body.inertia) * k2
 
 
+def _shift_coms(
+    spec: mujoco.MjSpec, model: mujoco.MjModel, table: SubjectTable
+) -> None:
+    """Move the centres of mass of ``table.com_forward`` forward (rest-pose anterior)."""
+    data = _rest(model)
+    for name, shift in table.com_forward.items():
+        body = spec.body(name)
+        R = _body_rotation(data, model, name)
+        body.ipos = np.asarray(body.ipos) + R.T @ (float(shift) * MYO_FORWARD)
+
+
 def _add_neck(spec: mujoco.MjSpec, model: mujoco.MjModel, gear: float) -> None:
     """Three hinges at the cervical base (3 cm above the shoulders) + torque motors."""
     data = _rest(model)
@@ -762,6 +780,7 @@ def build_subject_spec(
     _freeze_inertials(spec, model)
     _scale_geometry(spec, model, table)
     _scale_masses(spec, model, table)
+    _shift_coms(spec, model, table)
     _apply_ranges(spec, model, table)
     if table.wrist_obstacles:
         _repair_wrist_paths(spec, model, table)
@@ -1080,7 +1099,7 @@ def _plant_rest_from_joints(J: np.ndarray) -> np.ndarray:
 
 
 def main() -> None:
-    """Fit the subject table (or upgrade one), write it and print the audit."""
+    """Fit the subject table (or upgrade or recentre one), write it and print the audit."""
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -1091,6 +1110,10 @@ def main() -> None:
     ap.add_argument(
         "--upgrade", type=Path, default=None,
         help="instead of fitting: write this table upgraded to the round-3 plant (upgrade_table)",
+    )  # fmt: skip
+    ap.add_argument(
+        "--recentre", type=Path, default=None,
+        help="instead of fitting: write this table with the round-4 mass placement (R4_COM_FORWARD)",
     )  # fmt: skip
     ap.add_argument("--wrist-extension-deg", type=float, default=R3_WRIST_EXTENSION_DEG)
     ap.add_argument("--undo-shoulder-edit", action="store_true")
@@ -1109,6 +1132,13 @@ def main() -> None:
         "--xml-out", type=Path, default=None, help="also write the compiled model XML"
     )
     args = ap.parse_args()
+    if args.recentre is not None:
+        table = replace(
+            SubjectTable.load(args.recentre), com_forward=dict(R4_COM_FORWARD)
+        )
+        table.save(args.out)
+        print(f"wrote {args.out}: com_forward {table.com_forward}")
+        return
     if args.upgrade is not None:
         table = upgrade_table(
             SubjectTable.load(args.upgrade),

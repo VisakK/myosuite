@@ -40,7 +40,8 @@ import numpy as np
 
 from myosuite.core.trajectory_io import MotionClip
 
-# Per-step state saved by ``--record-state`` (besides ``qpos``), read before each step.
+# Per-step state saved by ``--record-state`` (besides ``qpos`` and the policy ``action``),
+# read before each step.
 STATE_KEYS = ("qvel", "act", "ctrl", "qacc", "actuator_force")
 
 
@@ -283,7 +284,7 @@ def rollout(
     survived = np.zeros(n_envs, int)
     err_sum = np.zeros(n_envs)
     traces = [[] for _ in range(n_envs)]
-    states = [{k: [] for k in STATE_KEYS} for _ in range(n_envs)]
+    states = [{k: [] for k in (*STATE_KEYS, "action")} for _ in range(n_envs)]
     # Termination margins at the last surviving step: worst site / max_site_err, mean site
     # error / MEAN_SITE_TERMINATION_M, root error / ROOT_TERMINATION_M. The largest names
     # the rule that ended the episode one control step later.
@@ -297,9 +298,14 @@ def rollout(
     ent = env.scene[ENTITY]
     with torch.inference_mode():
         for t in range(int(lengths.max()) - 1):
+            if action == "matched":
+                act = noise_matched_action(policy, obs, n_muscles)
+            else:
+                act = policy(obs, stochastic_output=action == "sampled")
             qpos = ent.data.data.qpos.cpu().numpy()
             extra = (
                 {k: getattr(ent.data.data, k).cpu().numpy() for k in STATE_KEYS}
+                | {"action": act.cpu().numpy()}
                 if record_state
                 else {}
             )
@@ -307,10 +313,6 @@ def rollout(
                 traces[i].append(qpos[i].copy())
                 for k, v in extra.items():
                     states[i][k].append(v[i].copy())
-            if action == "matched":
-                act = noise_matched_action(policy, obs, n_muscles)
-            else:
-                act = policy(obs, stochastic_output=action == "sampled")
             obs, _, dones, _ = wrapped.step(act)
             cache = _resolve_mimic_mjlab_ids(env, ENTITY, "fullbody")
             per_site = (

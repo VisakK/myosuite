@@ -479,6 +479,59 @@ def test_strength_scale_and_stiff_limits(base_model: mujoco.MjModel) -> None:
     )
 
 
+def test_com_forward_moves_only_the_mass_centre(base_model: mujoco.MjModel) -> None:
+    import dataclasses
+
+    from myosuite.integrations.yoga import subject_body as sb
+
+    table = dataclasses.replace(
+        _identity_table(base_model), com_forward={"torso": 0.03}
+    )
+    model = sb.compile_spec(sb.build_subject_spec(table))
+    d0, d1 = mujoco.MjData(base_model), mujoco.MjData(model)
+    mujoco.mj_forward(base_model, d0)
+    mujoco.mj_forward(model, d1)
+    b = model.body("torso").id
+    np.testing.assert_allclose(
+        d1.xipos[b] - d0.xipos[b], 0.03 * sb.MYO_FORWARD, atol=1e-9
+    )
+    others = np.arange(model.nbody) != b
+    np.testing.assert_allclose(d1.xipos[others], d0.xipos[others], atol=1e-12)
+    np.testing.assert_allclose(model.body_mass, base_model.body_mass, rtol=1e-9)
+    np.testing.assert_allclose(model.body_inertia, base_model.body_inertia, rtol=1e-9)
+    share = base_model.body_mass[b] / base_model.body_mass.sum()
+    np.testing.assert_allclose(
+        d1.subtree_com[1] - d0.subtree_com[1], 0.03 * share * sb.MYO_FORWARD, atol=1e-9
+    )
+
+
+def test_wrist_targets_follow_the_markers_only_with_the_hand_down() -> None:
+    from myosuite.integrations.yoga import retarget as rt
+
+    fps, T = 60.0, 600
+    names = [lm.name for lm in rt.landmark_set()]
+    tg = np.zeros((T, len(names), 3))
+    contact = np.zeros((T, len(rt.PLANT_BODIES)), bool)
+    contact[200:400, rt.PI["L_Wrist"]] = True
+    contact[:, rt.PI["R_Hand"]] = True
+    markers = np.tile([0.02, -0.01, 0.05], (T, 2, 1))
+    markers[250:260, 0] = np.nan  # a short gap is bridged, without weight
+    markers[:, 1] = np.nan  # never seen: the right wrist stays
+    out, gate = rt.pin_wrist_targets(tg, names, contact, markers, fps)
+    wl, wr, dors = (names.index(n) for n in ("wrist_l", "wrist_r", "farm_dors_l"))
+    np.testing.assert_allclose(out[320, wl], [0.02, -0.01, 0.0])  # height kept
+    np.testing.assert_allclose(out[320, dors], out[320, wl])
+    np.testing.assert_array_equal(out[:150, wl], 0.0)
+    np.testing.assert_array_equal(out[:, wr], 0.0)
+    assert gate[320, 0] == pytest.approx(1.0) and gate[255, 0] < 1.0
+    assert (gate[:, 1] == 0.0).all() and (gate[:150, 0] == 0.0).all()
+    moved = np.setdiff1d(np.nonzero(np.abs(out - tg).sum((0, 2)))[0], [wl, dors])
+    assert moved.size == 0
+    # The target moves by at most the ramp's step per frame.
+    step = np.abs(np.diff(out[:, wl, 0])).max()
+    assert step <= 0.02 / (rt.WRIST_MARKER_RAMP_S * fps) + 1e-12
+
+
 def test_statics_limit_reactions_follow_the_joint_set(
     base_model: mujoco.MjModel,
 ) -> None:

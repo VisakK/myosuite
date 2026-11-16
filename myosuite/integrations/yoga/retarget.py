@@ -15,6 +15,8 @@ angles cannot be copied. The retarget is OpenSim-style marker inverse kinematics
    (couplings applied exactly, joint ranges as a box) minimises weighted landmark
    errors plus floor terms: no collider below the floor, and every plant body that
    touches the floor in the reference pulls its MyoFullBody counterpart onto it.
+3. **Wrist markers (optional).** While a hand is on the floor, the wrist's horizontal
+   target is her measured wrist-marker centre instead of the registered point.
 
 Output is a MuscleMimic clip ``.npz`` at the control rate (``qpos``, ``qvel``,
 ``site_xpos``, ``site_names``, ``frequency``) plus a metrics ``.json``.
@@ -23,7 +25,8 @@ CLI::
 
     python -m myosuite.integrations.yoga.retarget --table subject_table.json \
         --mosh-pkl <fit.pkl> --smplx SMPLX_FEMALE.npz --plant-xml <plant.xml> \
-        --refs <dir of reference npz> --out <dir> [--clips substr ...] [--workers 16]
+        --refs <dir of reference npz> --out <dir> [--clips substr ...] [--workers 16] \
+        [--wrist-markers <dir of per-clip npz>]
 """
 
 from __future__ import annotations
@@ -66,6 +69,10 @@ PRIOR_JOINTS = (
 W_PRIOR = 0.02
 W_BRACE = (
     3.0  # weight of body-body overlap beyond the allowance (with --brace-allowance)
+)
+WRIST_MARKER_RAMP_S = 0.5  # a marker target fades in and out over this time
+W_WRIST_MARKER = (
+    2.0  # wrist weight on its marker (a measured joint centre; 0.7 otherwise)
 )
 
 # Plant body -> MyoFullBody body that carries its transplanted collider.
@@ -133,6 +140,58 @@ def registration_model(table: sb.SubjectTable) -> mujoco.MjModel:
     return sb.compile_spec(
         sb.build_subject_spec(dataclasses.replace(table, colliders=[]))
     )
+
+
+def wrist_marker_gate(on_floor: np.ndarray, seen: np.ndarray, fps: float) -> np.ndarray:
+    """``(T,)`` weight of the marker target: 1 while the hand is down and its marker seen.
+
+    A moving average over :data:`WRIST_MARKER_RAMP_S` ramps it at every change.
+    """
+    n = max(int(round(WRIST_MARKER_RAMP_S * fps)) | 1, 1)
+    on = np.pad((on_floor & seen).astype(float), n // 2, mode="edge")
+    return np.convolve(on, np.full(n, 1.0 / n), mode="valid")
+
+
+def pin_wrist_targets(
+    targets: np.ndarray,
+    names: list[str],
+    contact: np.ndarray,
+    markers: np.ndarray,
+    fps: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Move the wrist targets onto her wrist markers while the hand is on the floor.
+
+    The wrist landmark is registered on the plant's forearm at its T-pose offset; a wrist
+    bent ~90 deg carries that point centimetres off her wrist. Where the plant's palm or
+    fingers touch the floor, the horizontal target of ``wrist_{s}`` is blended onto the
+    marker centre; ``farm_dors_{s}``, defined relative to the wrist, moves with it. Heights
+    are kept (skin markers sit above the joint; the floor terms seat the hand).
+
+    Args:
+        targets: ``(T, L, 3)`` landmark targets.
+        names: The ``L`` landmark names.
+        contact: ``(T, 24)`` plant bodies on the floor.
+        markers: ``(T, 2, 3)`` wrist-marker centres (left, right) in the reference frame,
+            NaN where unseen (gaps are bridged linearly and get no weight).
+        fps: Frame rate (Hz).
+
+    Returns:
+        The new targets and the ``(T, 2)`` marker weight.
+    """
+    out = targets.copy()
+    t = np.arange(len(targets))
+    gate = np.zeros((len(targets), 2))
+    for k, (s, S) in enumerate(sb.PLANT_SIDE.items()):
+        seen = np.isfinite(markers[:, k]).all(1)
+        if not seen.any():
+            continue
+        on_floor = contact[:, PI[f"{S}_Wrist"]] | contact[:, PI[f"{S}_Hand"]]
+        gate[:, k] = wrist_marker_gate(on_floor, seen, fps)
+        xy = np.stack([np.interp(t, t[seen], markers[seen, k, i]) for i in range(2)], 1)
+        shift = gate[:, k, None] * (xy - targets[:, names.index(f"wrist_{s}"), :2])
+        for n in (f"wrist_{s}", f"farm_dors_{s}"):
+            out[:, names.index(n), :2] += shift
+    return out, gate
 
 
 @dataclass(frozen=True)
@@ -516,7 +575,7 @@ class Retargeter:
 
     def _residual(
         self, q: np.ndarray, tgt: np.ndarray, contact: list[str], q_prev: np.ndarray | None,
-        w_contact: float, w_pen: float, w_reg: float,
+        w_contact: float, w_pen: float, w_reg: float, weights: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:  # fmt: skip
         m, d = self.model, self.data
         d.qpos[:] = q
@@ -535,8 +594,9 @@ class Retargeter:
             p = d.xpos[b] + off
             jp, jr = jb[b]
             J = jp - _skew(off) @ jr
-            rows.append(lm.weight * (p - tgt[i]))
-            jac.append(lm.weight * J)
+            w = lm.weight if weights is None else weights[i]
+            rows.append(w * (p - tgt[i]))
+            jac.append(w * J)
         geoms = self.all_colliders
         low = _lowest_points(
             m.geom_type[geoms],
@@ -601,15 +661,19 @@ class Retargeter:
     def solve_frame(
         self, q0: np.ndarray, tgt: np.ndarray, contact: list[str], q_prev: np.ndarray | None,
         iters: int = 8, w_contact: float = 2.0, w_pen: float = 5.0, w_reg: float = 0.02,
-        frozen: tuple[int, ...] = (),
+        frozen: tuple[int, ...] = (), weights: np.ndarray | None = None,
     ) -> tuple[np.ndarray, float]:  # fmt: skip
         """Projected LM on the independent coordinates; returns ``(qpos, cost)``.
 
-        Independent coordinates listed in *frozen* keep their value from *q0*.
+        Independent coordinates listed in *frozen* keep their value from *q0*; *weights*
+        (``(L,)``) replaces the landmark weights for this frame.
         """
         m = self.model
         q = self.rk.clamp(q0)
-        r, Jf = self._residual(q, tgt, contact, q_prev, w_contact, w_pen, w_reg)
+        res = lambda x: self._residual(  # noqa: E731
+            x, tgt, contact, q_prev, w_contact, w_pen, w_reg, weights
+        )
+        r, Jf = res(q)
         cost = float(r @ r)
         lam = 1e-3
         for _ in range(iters):
@@ -625,7 +689,7 @@ class Retargeter:
             qn = q.copy()
             mujoco.mj_integratePos(m, qn, v, 1.0)
             qn = self.rk.clamp(qn)
-            rn, Jn = self._residual(qn, tgt, contact, q_prev, w_contact, w_pen, w_reg)
+            rn, Jn = res(qn)
             cn = float(rn @ rn)
             if cn < cost:
                 q, r, Jf, cost = qn, rn, Jn, cn
@@ -658,11 +722,25 @@ class Retargeter:
         q[:3] += tgt - hip
         return q
 
-    def retarget(self, ref: YogaReference, iters: int = 12) -> tuple[np.ndarray, dict]:
-        """Solve every frame. Returns ``(qpos (T, nq) at the reference rate, metrics)``."""
-        tg = self.targets(ref)
+    def retarget(
+        self, ref: YogaReference, iters: int = 12, wrist_markers: np.ndarray | None = None
+    ) -> tuple[np.ndarray, dict]:  # fmt: skip
+        """Solve every frame. Returns ``(qpos (T, nq) at the reference rate, metrics)``.
+
+        With *wrist_markers* (``(T, 2, 3)``, see :func:`pin_wrist_targets`) the wrists
+        follow her markers while the hands are on the floor.
+        """
+        tg = tg_plant = self.targets(ref)
         low = plant_body_lowest(ref, self.colliders)
         contact = low < FLOOR_CONTACT_M
+        gate = None
+        W = np.tile([lm.weight for lm in self.landmarks], (ref.n_frames, 1))
+        if wrist_markers is not None:
+            names = [lm.name for lm in self.landmarks]
+            tg, gate = pin_wrist_targets(tg, names, contact, wrist_markers, ref.fps)
+            for k, s in enumerate(sb.SIDES):
+                i = names.index(f"wrist_{s}")
+                W[:, i] += gate[:, k] * (W_WRIST_MARKER - W[:, i])
         q = self.initial_qpos(ref)
         q, _ = self.solve_frame(
             q,
@@ -670,6 +748,7 @@ class Retargeter:
             [PLANT_BODIES[b] for b in np.nonzero(contact[0])[0]],
             None,
             iters=60,
+            weights=W[0],
         )
         Q = np.empty((ref.n_frames, self.model.nq))
         prev = None
@@ -677,34 +756,74 @@ class Retargeter:
         restarts = 0
         for t in range(ref.n_frames):
             cs = [PLANT_BODIES[b] for b in np.nonzero(contact[t])[0]]
-            q, c = self.solve_frame(q, tg[t], cs, prev, iters=iters if t else 30)
+            q, c = self.solve_frame(
+                q, tg[t], cs, prev, iters=iters if t else 30, weights=W[t]
+            )
             typical = float(np.median(costs[-30:])) if costs else c
             if t and c > max(2.0 * typical, 0.01):
                 # Warm starts can stay in a worse basin (e.g. a twisted arm): try a cold start.
                 qc, cc = self.solve_frame(
-                    self.initial_qpos(ref, t), tg[t], cs, prev, iters=60
+                    self.initial_qpos(ref, t), tg[t], cs, prev, iters=60, weights=W[t]
                 )
                 if cc < c:
                     q, c = qc, cc
                     restarts += 1
             if self.lock_elbows_deg is not None:
-                q, c = self._lock_elbows(q, c, tg[t], cs, prev, iters)
+                q_test = None
+                if gate is not None and gate[t].any():
+                    # A pinned wrist bends the solved elbow a few degrees: read the
+                    # straight arms off the solve without the pin.
+                    q_test, _ = self.solve_frame(q, tg_plant[t], cs, prev, iters=iters)
+                q, c = self._lock_elbows(q, c, tg[t], cs, prev, iters, W[t], q_test)
             costs.append(c)
             Q[t] = q
             prev = q
         met = self.metrics(Q, tg, contact)
         met["cold_restarts"] = restarts
+        if gate is not None:
+            met["wrist_marker"] = self._wrist_marker_metrics(Q, tg, contact, gate)
         return Q, met
+
+    def _wrist_marker_metrics(
+        self, Q: np.ndarray, tg: np.ndarray, contact: np.ndarray, gate: np.ndarray
+    ) -> dict:
+        """Share of hand-on-floor frames pinned, and the solved wrists' horizontal miss."""
+        m, d = self.model, self.data
+        out: dict = {}
+        for k, (s, S) in enumerate(sb.PLANT_SIDE.items()):
+            i = next(
+                j for j, lm in enumerate(self.landmarks) if lm.name == f"wrist_{s}"
+            )
+            on = contact[:, PI[f"{S}_Wrist"]] | contact[:, PI[f"{S}_Hand"]]
+            pinned = np.nonzero(gate[:, k] > 0.99)[0]
+            miss = np.empty(len(pinned))
+            b = self._body_id[f"lunate_{s}"]
+            for n, t in enumerate(pinned):
+                d.qpos[:] = Q[t]
+                mujoco.mj_kinematics(m, d)
+                miss[n] = np.linalg.norm(d.xpos[b, :2] - tg[t, i, :2])
+            out[s] = {
+                "floor_frames": int(on.sum()),
+                "pinned_frames": int(len(pinned)),
+                "miss_median_m": float(np.median(miss)) if len(miss) else None,
+                "miss_p95_m": float(np.percentile(miss, 95)) if len(miss) else None,
+            }
+        return out
 
     def _lock_elbows(
         self, q: np.ndarray, cost: float, tgt: np.ndarray, contact: list[str],
-        q_prev: np.ndarray | None, iters: int,
+        q_prev: np.ndarray | None, iters: int, weights: np.ndarray | None = None,
+        q_test: np.ndarray | None = None,
     ) -> tuple[np.ndarray, float]:  # fmt: skip
-        """Re-solve a frame with straight-arm supporting elbows locked at 0."""
+        """Re-solve a frame with straight-arm supporting elbows locked at 0.
+
+        The elbows to lock are read from *q_test* (*q* by default).
+        """
         lim = np.radians(float(self.lock_elbows_deg))
+        test = q if q_test is None else q_test
         lock = [
             (qadr, col) for S, (qadr, col) in self._elbows.items()
-            if (f"{S}_Wrist" in contact or f"{S}_Hand" in contact) and q[qadr] < lim
+            if (f"{S}_Wrist" in contact or f"{S}_Hand" in contact) and test[qadr] < lim
         ]  # fmt: skip
         if not lock:
             return q, cost
@@ -718,6 +837,7 @@ class Retargeter:
             q_prev,
             iters=max(iters, 20),
             frozen=tuple(c for _, c in lock),
+            weights=weights,
         )
 
     def metrics(self, Q: np.ndarray, tg: np.ndarray, contact: np.ndarray) -> dict:
@@ -898,6 +1018,7 @@ def _worker(job: tuple) -> tuple[str, dict]:
         brace_allowance,
         split_hands,
         lock_elbows,
+        markers_dir,
     ) = job
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     table = sb.SubjectTable.load(Path(table_path))
@@ -913,7 +1034,14 @@ def _worker(job: tuple) -> tuple[str, dict]:
         lock_elbows_deg=lock_elbows,
     )
     ref = load_reference(Path(ref_path))
-    Q, met = rt.retarget(ref)
+    markers = None
+    if markers_dir is not None and (Path(markers_dir) / f"{ref.name}.npz").exists():
+        markers = np.load(Path(markers_dir) / f"{ref.name}.npz")["wrist"]
+        if len(markers) != ref.n_frames:
+            raise ValueError(
+                f"{ref.name}: {len(markers)} marker frames, {ref.n_frames} reference frames"
+            )
+    Q, met = rt.retarget(ref, wrist_markers=markers)
     np.save(Path(out_dir) / f"{ref.name}.qpos60.npy", Q)
     Q100 = resample(model, rt.rk, Q, ref.fps, CONTROL_HZ)
     write_clip(model, Q100, CONTROL_HZ, Path(out_dir) / f"{ref.name}.npz")
@@ -950,6 +1078,11 @@ def main() -> None:
         "--lock-elbows", type=float, default=None, metavar="DEG",
         help="straighten supporting elbows flexed less than DEG (hand on the floor)",
     )  # fmt: skip
+    ap.add_argument(
+        "--wrist-markers", type=Path, default=None, metavar="DIR",
+        help="per-clip <name>.npz with 'wrist' (T, 2, 3): her wrist-marker centres (left, right) in the "
+        "reference frame, NaN where unseen; the wrists follow them while the hands are on the floor",
+    )  # fmt: skip
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     refs = sorted(args.refs.glob("*.npz"))
@@ -966,6 +1099,7 @@ def main() -> None:
             args.brace_allowance,
             args.split_hand_contacts,
             args.lock_elbows,
+            None if args.wrist_markers is None else str(args.wrist_markers),
         )
         for r in refs
     ]
