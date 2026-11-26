@@ -11,9 +11,11 @@ headline tests of :mod:`.evaluate` (README §4):
 * ``frozen``: the reference held still at chosen times for ``horizon_s`` ("can it hold
   the pose?"), ``frozen_replicas`` replicas each;
 * ``sweep``: ``horizon_s`` from every ``sweep_step_s`` of the clip ("which parts are
-  learnt?"), split into starts inside the named hold windows and all other starts.
+  learnt?"), split into starts inside the named hold windows and all other starts;
+* ``whole`` (optional): the whole clip from its first frame to its end.
 
-Every rollout uses the policy's mean action and ends at the task's own termination rules.
+Every rollout ends at the task's own termination rules. By default the policy's
+deterministic action is played; sampled actions can be scored beside it.
 """
 
 from __future__ import annotations
@@ -35,7 +37,8 @@ class EvalSpec:
         sweep_step_s: Spacing of the sweep starts (s).
         sweep_replicas: Replicas per sweep start.
         hold_windows_s: ``(start, end)`` windows (s) whose sweep starts count as "hold".
-        horizon_s: Length of every rollout (s).
+        horizon_s: Length of every frozen and sweep rollout (s).
+        whole_replicas: Rollouts of the whole clip from its first frame (0: none).
     """
 
     frozen_at_s: tuple[float, ...] = (19.88,)
@@ -44,6 +47,7 @@ class EvalSpec:
     sweep_replicas: int = 4
     hold_windows_s: tuple[tuple[float, float], ...] = ((14.0, 23.0), (36.0, 45.0))
     horizon_s: float = 10.0
+    whole_replicas: int = 0
 
 
 class InTrainingEvaluator:
@@ -91,15 +95,22 @@ class InTrainingEvaluator:
             for t in spec.frozen_at_s
         )
         sweep = start_sweep((src,), spec.sweep_step_s)
-        self.bank = frozen + sweep
+        whole = (src,) if spec.whole_replicas > 0 else ()
+        self.bank = frozen + sweep + whole
         names = clip_names(self.bank)
         self.names = [f"frozen@{t:g}s" for t in spec.frozen_at_s] + names[len(frozen) :]
         self.n_frozen = len(frozen)
         self.sweep_start_s = [
-            float(n.rsplit("@", 1)[1][:-1]) for n in names[len(frozen) :]
+            float(n.rsplit("@", 1)[1][:-1])
+            for n in names[len(frozen) : len(frozen) + len(sweep)]
         ]
-        reps = [spec.frozen_replicas] * len(frozen) + [spec.sweep_replicas] * len(sweep)
+        reps = (
+            [spec.frozen_replicas] * len(frozen)
+            + [spec.sweep_replicas] * len(sweep)
+            + [spec.whole_replicas] * len(whole)
+        )
         self.clip_of = np.concatenate([np.full(r, i) for i, r in enumerate(reps)])
+        self.is_whole = self.clip_of >= len(frozen) + len(sweep)
         kwargs = dict(cfg_kwargs)
         if kwargs.get("action_space") == "joint" and kwargs.get("feedforward") is None:
             from myosuite.integrations.yoga.feedforward import (
@@ -121,28 +132,37 @@ class InTrainingEvaluator:
         )
         self.env = ManagerBasedRlEnv(cfg=cfg, device="cuda")
         self.wrapped = RslRlVecEnvWrapper(self.env)
-        lengths = np.array([len(c.qpos) for c in self.bank])
-        self.lengths = np.minimum(lengths, int(round(spec.horizon_s / CTRL_DT)))[
-            self.clip_of
-        ]
+        lengths = np.array([len(c.qpos) for c in self.bank])[self.clip_of]
+        horizon = int(round(spec.horizon_s / CTRL_DT))
+        self.lengths = np.where(self.is_whole, lengths, np.minimum(lengths, horizon))
         self.ctrl_dt = CTRL_DT
 
-    def __call__(self, policy: Any) -> dict[str, float]:
-        """Mean-action survival on every evaluation clip; returns scalar metrics (s)."""
+    def __call__(
+        self, policy: Any, stochastic: bool = False, whole: bool = True
+    ) -> dict[str, float]:
+        """Survival on every evaluation clip; returns scalar metrics (s).
+
+        Args:
+            policy: The actor.
+            stochastic: Play sampled actions instead of the deterministic one.
+            whole: Also play the whole-clip rollouts (if the spec has any).
+        """
         import torch
 
         from myosuite.integrations.yoga.evaluate import _force_starts
         from myosuite.integrations.yoga.task import ENTITY
 
         n_env = len(self.clip_of)
-        alive = np.ones(n_env, bool)
+        alive = np.ones(n_env, bool) if whole else ~self.is_whole
+        played = alive.copy()
         survived = np.zeros(n_env, int)
         with torch.inference_mode():
             self.wrapped.reset()
             _force_starts(self.env, ENTITY, self.clip_of.tolist(), [0] * n_env)
             obs = self.wrapped.get_observations()
-            for t in range(int(self.lengths.max()) - 1):
-                obs, _, dones, _ = self.wrapped.step(policy(obs))
+            for t in range(int(self.lengths[played].max()) - 1):
+                act = policy(obs, stochastic_output=stochastic)
+                obs, _, dones, _ = self.wrapped.step(act)
                 d = dones.cpu().numpy().astype(bool)
                 survived[alive & ~d] += 1
                 alive &= ~d
@@ -175,7 +195,11 @@ class InTrainingEvaluator:
             float(per_start[~hold].mean()) if (~hold).any() else float("nan")
         )
         out["sweep_all_mean_s"] = float(per_start.mean())
-        out["sweep_completed_frac"] = float(full[self.clip_of >= self.n_frozen].mean())
+        in_sweep = (self.clip_of >= self.n_frozen) & ~self.is_whole
+        out["sweep_completed_frac"] = float(full[in_sweep].mean())
+        if whole and self.is_whole.any():
+            out["whole_mean_s"] = float(sec[self.is_whole].mean())
+            out["whole_finished_frac"] = float(full[self.is_whole].mean())
         return out
 
     def close(self) -> None:

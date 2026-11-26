@@ -172,7 +172,9 @@ def _worker(args: tuple) -> list[tuple[int, int, float, np.ndarray, np.ndarray]]
         data.qpos[:] = q
         data.qvel[:] = 0.0
         mujoco.mj_forward(model, data)
-        mujoco.mj_fullM(model, full_m, data.qM)
+        mujoco.mju_sym2dense(
+            full_m, data.M, model.M_rownnz, model.M_rowadr, model.M_colind
+        )
         tmap = rk.velocity_map(q)
         inertia = np.einsum("ik,ij,jk->k", tmap, full_m, tmap)[hinge_cols]
         if planted:

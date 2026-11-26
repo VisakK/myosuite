@@ -8,10 +8,13 @@ Built on the MuscleMimic full-body mimic task (DeepMimic composite reward,
 reference-state initialisation over a clip bank, lookahead observations), with:
 
 * the subject-scaled MyoFullBody (:mod:`.subject_body`) instead of the stock body;
-* the three neck torque motors as a second action term (MyoFullBody has no neck);
+* the three neck torque motors as a second action term (MyoFullBody has no neck),
+  driven by the policy or held on the reference by a servo (:mod:`.neck`);
 * a muscle-effort penalty (mean squared activation);
 * the PhysX teacher's per-body deviation rule: any tracked site more than
-  ``max_site_err`` from its target ends the episode.
+  ``max_site_err`` from its target ends the episode;
+* optionally a body-relative observation in the ProtoMotions style (:mod:`.body_obs`) and
+  a discrete policy head over excitation levels (:mod:`.levels`).
 
 The clips are local (MOYO/AMASS-licensed), so the task is registered by
 :func:`register_yoga_task` at runtime rather than at import.
@@ -34,6 +37,39 @@ TASK_ID = "myoMimicYoga-v0"
 ENTITY = "yoga_subject_robot"
 SIM_DT = 0.002
 CTRL_DT = 0.01
+
+
+@dataclasses.dataclass(frozen=True)
+class BodyObsCfg:
+    """Settings of the body-relative observation (:mod:`.body_obs`).
+
+    Attributes:
+        target_steps: Future frames (control steps ahead) of the full target block.
+        preview_steps: Future frames of the position preview.
+        muscle_state: ``"full"`` (activation, length, velocity, force), ``"act"`` or
+            ``"none"``.
+    """
+
+    target_steps: tuple[int, ...] = (1,)
+    preview_steps: tuple[int, ...] = (5, 10, 20, 50, 100)
+    muscle_state: str = "full"
+
+
+@dataclasses.dataclass(frozen=True)
+class LevelsCfg:
+    """Settings of the discrete policy head (:class:`.levels.LevelsDistribution`).
+
+    Attributes:
+        levels: Excitation levels per muscle, evenly spaced in ``[0, 1]``.
+        p_rest: Probability of level 0 at the start of training.
+        deterministic: Output without sampling, ``"mean"`` or ``"mode"``.
+        ordinal: Parameterise the logits by adjacent log-odds.
+    """
+
+    levels: int = 5
+    p_rest: float = 0.9
+    deterministic: str = "mean"
+    ordinal: bool = False
 
 
 def load_yoga_clips(
@@ -88,6 +124,11 @@ def yoga_env_cfg(
     action_space: str = "muscle",
     coord: Any = None,
     feedforward: list[np.ndarray] | None = None,
+    start_interval_s: float | None = None,
+    muscle_mode: str = "sigmoid",
+    obs: BodyObsCfg | None = None,
+    neck: str = "policy",
+    adaptive_starts: Any = None,
 ) -> Any:
     """The yoga tracking task as a :class:`mjlab.envs.ManagerBasedRlEnvCfg`.
 
@@ -107,6 +148,18 @@ def yoga_env_cfg(
             when ``None``).
         feedforward: For ``"joint"``: per clip, the static feed-forward hinge torques
             (:func:`~.feedforward.bank_feedforward`).
+        start_interval_s: Episodes start only at clip times that are multiples of this
+            (s), uniformly; ``None`` starts at any frame.
+        muscle_mode: For ``"muscle"``: ``"sigmoid"`` maps an action ``a`` to the excitation
+            ``sigmoid(5 (a - 0.5))``; ``"excitation"`` uses the action as the excitation
+            (clipped to ``[0, 1]``), as the discrete head writes it.
+        obs: Body-relative observation groups ``actor`` and ``critic`` (the critic reads
+            both); ``None`` keeps the world-frame observation in all groups.
+        neck: For ``"muscle"``: ``"policy"``: three torque outputs of the policy drive
+            the neck motors. ``"servo"``: a PD holds the neck on the reference
+            (:mod:`.neck`) and every policy output is a muscle excitation.
+        adaptive_starts: ``AdaptiveStartsCfg`` of the mimic task: episode starts
+            weighted by where episodes end early; ``None`` keeps them uniform.
 
     Returns:
         The environment config.
@@ -114,6 +167,13 @@ def yoga_env_cfg(
     if action_space not in ("muscle", "joint"):
         raise ValueError(
             f"action_space must be 'muscle' or 'joint', got {action_space!r}"
+        )
+    if neck not in ("policy", "servo"):
+        raise ValueError(f"neck must be 'policy' or 'servo', got {neck!r}")
+    if neck == "servo" and (action_space == "joint" or not table.neck):
+        raise ValueError(
+            "neck='servo' needs the muscle action space and a table with a neck"
+            " (the joint action space has its own neck servo)"
         )
     from mjlab.actuator import XmlActuatorCfg
     from mjlab.actuator.actuator import TransmissionType
@@ -138,6 +198,8 @@ def yoga_env_cfg(
         muscle_actuators=muscles, tendon_targets=tendons, sim_dt=SIM_DT, ctrl_dt=CTRL_DT,
         max_episode_steps=max_episode_steps, clip=clips, num_envs=num_envs, mj_model=mj,
         mimic_reward_weight=mimic_reward_weight, max_site_err_threshold=max_site_err,
+        rsi_start_interval=None if start_interval_s is None else max(1, round(start_interval_s / CTRL_DT)),
+        action_mode=muscle_mode, rsi_adaptive=adaptive_starts,
     )  # fmt: skip
     if table.neck:
         entity = cfg.scene.entities[ENTITY]
@@ -148,9 +210,16 @@ def yoga_env_cfg(
                 transmission_type=TransmissionType.JOINT,
             ),
         )
-        cfg.actions["neck"] = JointEffortActionCfg(
-            entity_name=ENTITY, actuator_names=sb.NECK_JOINTS, scale=1.0
-        )
+        if neck == "servo":
+            from myosuite.integrations.yoga.neck import NeckServoActionCfg
+
+            cfg.actions["neck"] = NeckServoActionCfg(
+                entity_name=ENTITY, mj_model=mj, clips=clips, ctrl_dt=CTRL_DT
+            )
+        else:
+            cfg.actions["neck"] = JointEffortActionCfg(
+                entity_name=ENTITY, actuator_names=sb.NECK_JOINTS, scale=1.0
+            )
     if action_space == "joint":
         from myosuite.integrations.yoga.coordination import (
             CoordinatedMuscleActionCfg,
@@ -171,6 +240,25 @@ def yoga_env_cfg(
                 feedforward=feedforward,
             )  # fmt: skip
         }
+    if obs is not None:
+        from myosuite.envs.myo.backends.mjlab.mimic_mjlab_env import (
+            _mimic_obs_clip_phase,
+        )
+        from myosuite.integrations.yoga.body_obs import (
+            body_observation_groups,
+            build_body_reference,
+        )
+
+        cfg.observations = body_observation_groups(
+            ENTITY,
+            build_body_reference(mj, clips, CTRL_DT),
+            _mimic_obs_clip_phase(ENTITY, "fullbody", clips, CTRL_DT),
+            **dataclasses.asdict(obs),
+        )
+    # The mimic task takes its solver options from the stock model: friction is the subject's.
+    elliptic = int(mj.opt.cone) == int(mujoco.mjtCone.mjCONE_ELLIPTIC)
+    cfg.sim.mujoco.cone = "elliptic" if elliptic else "pyramidal"
+    cfg.sim.mujoco.impratio = float(mj.opt.impratio)
     # mjlab multiplies reward terms by ctrl_dt; divide so the weight is per step.
     cfg.rewards["effort"] = RewardTermCfg(
         func=_muscle_effort(ENTITY, len(muscles)), weight=-effort_weight / CTRL_DT
@@ -186,6 +274,10 @@ def yoga_runner_cfg(
     entropy_coef: float = 0.001,
     num_learning_epochs: int = 4,
     num_mini_batches: int = 4,
+    levels: LevelsCfg | None = None,
+    n_gauss: int = 0,
+    critic_hidden: tuple[int, ...] | None = None,
+    body_obs: bool = False,
     **kwargs: Any,
 ) -> Any:
     """rsl_rl PPO settings for the yoga bank (wider nets than the single-clip default).
@@ -198,25 +290,43 @@ def yoga_runner_cfg(
     ``max_std`` caps the action noise. Through the sigmoid muscle mapping, noise on a
     silent muscle raises its mean activation (co-contraction the mean action lacks),
     so an uncapped std can grow during training.
+
+    ``levels`` replaces the Gaussian by the discrete head of :mod:`.levels`: one choice
+    among excitation levels per muscle, and ``n_gauss`` Gaussian outputs at the end of the
+    action (the neck motors) with ``init_std`` / ``max_std``. ``body_obs`` maps the
+    observation groups of :class:`BodyObsCfg`: the critic reads ``actor`` and ``critic``.
     """
     from mjlab.rl import RslRlModelCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg
 
-    distribution: dict[str, Any] = {
-        "class_name": "GaussianDistribution",
-        "init_std": init_std,
-        "std_type": "scalar",
-    }
-    if max_std is not None:
-        distribution["std_range"] = (1e-6, max_std)
+    distribution: dict[str, Any]
+    if levels is not None:
+        from myosuite.integrations.yoga.levels import LEVELS_CLASS
+
+        distribution = {
+            "class_name": LEVELS_CLASS, "n_gauss": n_gauss, "init_std": init_std,
+            **dataclasses.asdict(levels),
+        }  # fmt: skip
+        if max_std is not None:
+            distribution["max_std"] = max_std
+    else:
+        distribution = {
+            "class_name": "GaussianDistribution",
+            "init_std": init_std,
+            "std_type": "scalar",
+        }
+        if max_std is not None:
+            distribution["std_range"] = (1e-6, max_std)
     actor = RslRlModelCfg(
         hidden_dims=hidden, activation="elu", obs_normalization=True, distribution_cfg=distribution
     )  # fmt: skip
     critic = RslRlModelCfg(
-        hidden_dims=hidden,
+        hidden_dims=critic_hidden or hidden,
         activation="elu",
         obs_normalization=True,
         distribution_cfg=None,
     )
+    if body_obs:
+        kwargs.setdefault("obs_groups", {"actor": ("actor",), "critic": ("actor", "critic")})  # fmt: skip
     algorithm = RslRlPpoAlgorithmCfg(
         num_learning_epochs=num_learning_epochs, num_mini_batches=num_mini_batches, learning_rate=3e-4, schedule="adaptive", desired_kl=desired_kl,
         entropy_coef=entropy_coef, clip_param=0.2, value_loss_coef=1.0, gamma=0.99, lam=0.95, max_grad_norm=1.0,

@@ -48,7 +48,11 @@ STATE_KEYS = ("qvel", "act", "ctrl", "qacc", "actuator_force")
 def _force_starts(
     env: Any, entity: str, clip_ids: list[int], offsets: list[int]
 ) -> None:
-    """Put env ``i`` on clip ``clip_ids[i]`` at frame ``offsets[i]`` (state and targets)."""
+    """Put env ``i`` on clip ``clip_ids[i]`` at frame ``offsets[i]``.
+
+    Writes the state and the targets and recomputes the observation: the observation
+    manager otherwise keeps returning the one of the reset before.
+    """
     import torch
     from mjlab.utils.lab_api.math import quat_apply
 
@@ -82,6 +86,8 @@ def _force_starts(
     ent.write_joint_state_to_sim(q[:, 7:], v[:, 6:], env_ids=ids)
     env.sim.forward()
     cache["synced_inputs"] = None
+    env.sim.sense()
+    env.obs_buf = env.observation_manager.compute(update_history=True)
 
 
 def run_task_kwargs(cfg_json: dict) -> dict:
@@ -95,6 +101,17 @@ def run_task_kwargs(cfg_json: dict) -> dict:
         from myosuite.integrations.yoga.coordination import CoordinationCfg
 
         out.update(action_space="joint", coord=CoordinationCfg(**coord))
+    obs = cfg_json.get("obs")
+    if obs:
+        from myosuite.integrations.yoga.task import BodyObsCfg
+
+        out["obs"] = BodyObsCfg(
+            tuple(obs["target_steps"]), tuple(obs["preview_steps"]), obs["muscle_state"]
+        )
+    if cfg_json.get("muscle_mode", "sigmoid") != "sigmoid":
+        out["muscle_mode"] = cfg_json["muscle_mode"]
+    if cfg_json.get("neck", "policy") != "policy":
+        out["neck"] = cfg_json["neck"]
     return out
 
 

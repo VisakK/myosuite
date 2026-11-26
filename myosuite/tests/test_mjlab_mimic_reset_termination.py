@@ -747,6 +747,123 @@ def test_clip_bank_partial_reset_uses_the_clips_of_the_reset_envs() -> None:
         env.close()
 
 
+def test_rsi_start_frames_cover_the_grid_of_each_clip() -> None:
+    """A start interval maps uniform draws onto its multiples below each clip's end."""
+    from myosuite.envs.myo.backends.mjlab import mimic_mjlab_env as mimic
+
+    rand = torch.arange(1200, dtype=torch.float32) / 1200
+    lengths = torch.tensor([60, 90, 75]).repeat(400)
+    frames = mimic._rsi_start_frames(rand, lengths, 20)
+    for i, n_starts in enumerate((3, 5, 4)):
+        starts, counts = torch.unique(frames[i::3], return_counts=True)
+        assert starts.tolist() == [20 * k for k in range(n_starts)]
+        assert int(counts.max() - counts.min()) <= 1
+    any_frame = mimic._rsi_start_frames(rand, lengths, None)
+    assert torch.equal(any_frame, torch.floor(rand * lengths).long())
+    assert len(torch.unique(any_frame[1::3])) == 90
+
+
+@pytest.mark.parametrize("bank", [False, True])
+def test_rsi_start_interval_resets_onto_the_grid(bank: bool) -> None:
+    """With ``rsi_start_interval`` every reset starts on a multiple of it, inside the clip."""
+    from myosuite.envs.myo.backends.mjlab import mimic_mjlab_env as mimic
+
+    clips = (
+        _synthetic_clip("fullbody", n_frames=75),
+        _synthetic_clip("fullbody", n_frames=90),
+    )
+    env = _make_env(
+        "fullbody", clips if bank else clips[0], num_envs=6, rsi_start_interval=20
+    )
+    try:
+        seen: set[int] = set()
+        for _ in range(8):
+            env.reset()
+            cache = mimic._resolve_mimic_mjlab_ids(env, _ENTITY["fullbody"], "fullbody")
+            source = cache["clip_source"]
+            offsets = source._start_offsets
+            lengths = (
+                source._clip_lengths[source._clip_indices] if bank else source.n_frames
+            )
+            assert bool(((offsets % 20 == 0) & (offsets < lengths)).all())
+            seen.update(offsets.tolist())
+        assert len(seen) > 1
+    finally:
+        env.close()
+    with pytest.raises(ValueError, match="start_interval"):
+        mimic._mimic_rsi_event(_ENTITY["fullbody"], "fullbody", clips, 0.02, None, 0)
+
+
+@pytest.mark.parametrize("bank", [False, True])
+def test_rsi_adaptive_starts_follow_recorded_failures(bank: bool) -> None:
+    """With ``rsi_adaptive`` an episode that ends early draws the next starts to it."""
+    from myosuite.envs.myo.backends.mjlab import mimic_mjlab_env as mimic
+    from myosuite.envs.myo.backends.mjlab.start_sampling import AdaptiveStartsCfg
+
+    clips = (
+        _synthetic_clip("fullbody", n_frames=75),
+        _synthetic_clip("fullbody", n_frames=90),
+    )
+    adaptive = AdaptiveStartsCfg(
+        uniform=0.0, lead=0, kernel=1, min_fail_s=0.0, min_hazard=1e-9, prior_visits=0.0
+    )
+    env = _make_env(
+        "fullbody",
+        clips if bank else clips[0],
+        num_envs=6,
+        rsi_start_interval=20,
+        rsi_adaptive=adaptive,
+    )
+    try:
+        env.reset()
+        cache = mimic._resolve_mimic_mjlab_ids(env, _ENTITY["fullbody"], "fullbody")
+        source, sampler = cache["clip_source"], cache["start_sampler"]
+        assert float(sampler.fail.sum()) == 0.0 and float(sampler.visit.sum()) == 0.0
+        assert bool((source._start_offsets % 20 == 0).all())
+        # Env 2 ends early, 5 steps into an episode from frame 40 (of clip 1 in a bank).
+        ids = torch.tensor([2], device=env.device)
+        source._start_offsets[ids] = 40
+        if bank:
+            source._clip_indices[ids] = 1
+        env.episode_length_buf[ids] = 5
+        env.termination_manager._terminated_buf[ids] = True
+        env.reset(env_ids=ids)
+        flat = int(sampler.fail.argmax())
+        assert int(sampler.clip_of[flat]) == (1 if bank else 0)
+        assert int(sampler.bin_in_clip[flat]) == 2
+        env.termination_manager._terminated_buf[:] = False
+        for _ in range(3):
+            env.reset()
+            assert bool((source._start_offsets == 40).all())
+            if bank:
+                assert bool((source._clip_indices == 1).all())
+    finally:
+        env.close()
+
+
+def test_forced_start_observation_is_the_forced_frames() -> None:
+    """After ``_force_starts`` the observation is that of the forced frame, not the reset's."""
+    from myosuite.integrations.yoga.evaluate import _force_starts
+
+    entity = _ENTITY["fullbody"]
+    clip = _synthetic_clip("fullbody", n_frames=90)
+    # A start interval longer than the clip: every reset is on frame 0.
+    env = _make_env("fullbody", clip, num_envs=3, rsi_start_interval=200)
+    try:
+        at_reset, _ = env.reset()
+        at_reset = {k: v.clone() for k, v in at_reset.items()}
+        _force_starts(env, entity, [0] * 3, [60] * 3)
+        moved = env.observation_manager.compute()
+        assert all(not torch.allclose(moved[k], at_reset[k]) for k in at_reset)
+        assert all(torch.equal(env.obs_buf[k], moved[k]) for k in moved)
+        _force_starts(env, entity, [0] * 3, [0] * 3)
+        back = env.observation_manager.compute()
+        for k in at_reset:
+            torch.testing.assert_close(back[k], at_reset[k], atol=1e-5, rtol=0.0)
+    finally:
+        env.close()
+
+
 def _assert_envs_read_their_clips(
     env: Any, entity: str, reset_ids: tuple[int, ...] = ()
 ) -> None:

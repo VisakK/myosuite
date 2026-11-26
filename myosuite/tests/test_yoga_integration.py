@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import importlib.util
+from pathlib import Path
 
 import mujoco
 import numpy as np
@@ -212,6 +213,26 @@ def test_start_sweep_cuts_and_names_each_start() -> None:
     assert cuts[2].qvel.shape == (150, 2) and cuts[2].qvel[0, 0] == 400.0
 
 
+def test_action_noise_is_copied_scaled_capped_and_frozen(tmp_path: Path) -> None:
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("rsl_rl")
+    from rsl_rl.modules.distribution import GaussianDistribution
+
+    from myosuite.integrations.yoga.train import set_action_noise
+
+    src = torch.tensor([0.05, 0.1, 0.3])
+    torch.save({"actor_state_dict": {"distribution.std_param": src}}, tmp_path / "a.pt")
+    dist = GaussianDistribution(3, init_std=0.2, std_range=(1e-6, 0.5))
+    set_action_noise(dist, tmp_path / "a.pt", scale=2.0, max_std=0.5, freeze=True)
+    assert torch.allclose(dist.std_param, torch.tensor([0.1, 0.2, 0.5]))
+    assert not dist.std_param.requires_grad
+    # Without options the noise is left as it is, and stays learnable.
+    dist = GaussianDistribution(3, init_std=0.2)
+    set_action_noise(dist)
+    assert torch.allclose(dist.std_param, torch.full((3,), 0.2))
+    assert dist.std_param.requires_grad
+
+
 def test_noise_matched_action_matches_the_noisy_mean_excitation() -> None:
     torch = pytest.importorskip("torch")
     from myosuite.integrations.yoga.evaluate import noise_matched_action
@@ -406,6 +427,26 @@ def _wrist_moment_arms(
     return np.array([-moment[model.actuator(n).id, dof] for n in names])
 
 
+_MUJOCO4 = mujoco.mj_version() >= 4000000
+
+
+def _wrist_lengths(
+    model: mujoco.MjModel, names: list[str], angles_deg: np.ndarray
+) -> np.ndarray:
+    """Tendon lengths (m) of *names* over right wrist flexion angles, elbow 90°, pronated."""
+    d = mujoco.MjData(model)
+    for j, v in (("elbow_flex_r", 90.0), ("pro_sup_r", 90.0)):
+        d.qpos[model.joint(j).qposadr[0]] = np.radians(v)
+    tendons = [int(model.actuator(n).trnid[0]) for n in names]
+    out = []
+    for angle in angles_deg:
+        d.qpos[model.joint("flexion_r").qposadr[0]] = np.radians(angle)
+        mujoco.mj_kinematics(model, d)
+        mujoco.mj_tendon(model, d)
+        out.append(d.ten_length[tendons].copy())
+    return np.array(out)
+
+
 def test_finger_flexors_are_kept_as_welded_wrist_muscles(
     base_model: mujoco.MjModel,
 ) -> None:
@@ -440,7 +481,13 @@ def test_wrist_obstacles_keep_the_moment_arms_beyond_the_stock_range(
     flexors, extensors = ["FCR", "FCU", "PL"], ["ECRL", "ECRB", "ECU"]
     for angle in (-95.0, -110.0):
         assert (_wrist_moment_arms(model, flexors, angle) > 0.009).all()
-        assert (_wrist_moment_arms(model, extensors, angle) < 0.0).all()
+    # MuJoCo 3 kept ECRL and ECU extensors out here by jumping them onto the obstacle
+    # (31-50 mm of tendon). MuJoCo 4 has no jump: they cross the axis near -102° and -90°.
+    if _MUJOCO4:
+        assert (_wrist_moment_arms(model, ["ECRL", "ECRB"], -95.0) < 0.0).all()
+    else:
+        for angle in (-95.0, -110.0):
+            assert (_wrist_moment_arms(model, extensors, angle) < 0.0).all()
     for angle in (
         -45.0,
         0.0,
@@ -451,6 +498,42 @@ def test_wrist_obstacles_keep_the_moment_arms_beyond_the_stock_range(
         ) - _wrist_moment_arms(base_model, flexors + extensors, angle)
         assert np.abs(diff).max() < 0.004
         assert np.abs(diff[1:3]).max() < 1e-9  # FCU and PL: the obstacle stays clear
+
+
+@pytest.mark.skipif(not _MUJOCO4, reason="round 5 places side sites for MuJoCo 4")
+def test_round5_paths_keep_their_side_without_jumps(base_model: mujoco.MjModel) -> None:
+    import dataclasses
+
+    from myosuite.integrations.yoga import subject_body as sb
+
+    table = sb.round5_table(
+        dataclasses.replace(
+            _identity_table(base_model),
+            finger_flexors=True,
+            wrist_obstacles={k: list(v) for k, v in sb.WRIST_OBSTACLES.items()},
+        )
+    )
+    model = sb.compile_spec(sb.build_subject_spec(table))
+    fingers = [f"FD{k}{i}" for k in "SP" for i in range(2, 6)]
+    for angle in (-95.0, -110.0):
+        assert (_wrist_moment_arms(model, fingers, angle) > 0.009).all()
+    lengths = _wrist_lengths(
+        model, list(sb.WRIST_OBSTACLES), np.arange(-110.0, 88.5, 0.5)
+    )
+    assert np.abs(np.diff(lengths, axis=0)).max() < 0.001  # per half degree
+    assert int(model.opt.cone) == int(mujoco.mjtCone.mjCONE_ELLIPTIC)
+    assert model.opt.impratio == sb.R5_FRICTION[1]
+    # teres major and latissimus 2 go round the humerus cylinder (about 140° of arc)
+    d = mujoco.MjData(model)
+    mujoco.mj_forward(model, d)
+    cylinder = model.geom("TMAJ_LAThum_cylinder")
+    obj, xpos = d.wrap_obj.reshape(-1), d.wrap_xpos.reshape(-1, 3)
+    for muscle in ("TMAJ", "LAT2"):
+        tid = int(model.actuator(muscle).trnid[0])
+        adr, num = int(d.ten_wrapadr[tid]), int(d.ten_wrapnum[tid])
+        on = np.flatnonzero(obj[adr : adr + num] == cylinder.id) + adr
+        assert len(on) == 2
+        assert np.linalg.norm(xpos[on[0]] - xpos[on[1]]) > 1.5 * cylinder.size[0]
 
 
 def test_strength_scale_and_stiff_limits(base_model: mujoco.MjModel) -> None:
@@ -588,7 +671,7 @@ def test_planted_inertia_is_the_body_about_the_planted_hinge() -> None:
     mujoco.mj_forward(model, data)
     assert data.ncon >= 3
     full_m = np.zeros((model.nv, model.nv))
-    mujoco.mj_fullM(model, full_m, data.qM)
+    mujoco.mju_sym2dense(full_m, data.M, model.M_rownnz, model.M_rowadr, model.M_colind)
     tmap = np.eye(model.nv)
     free = np.array([full_m[6, 6]])
     out = planted_hinge_inertia(
@@ -659,3 +742,365 @@ def test_replay_floor_reaction_carries_the_weight(base_model: mujoco.MjModel) ->
     assert np.all(
         (dyn["cop"] >= pts.min(axis=0) - 1e-6) & (dyn["cop"] <= pts.max(axis=0) + 1e-6)
     )
+
+
+def _levels_head(**kw):
+    import torch
+    from torch import nn
+
+    from myosuite.integrations.yoga.levels import LevelsDistribution
+
+    torch.manual_seed(0)
+    dist = LevelsDistribution(output_dim=8, levels=5, n_gauss=2, **kw)
+    mlp = nn.Sequential(nn.Linear(6, 16), nn.ELU(), nn.Linear(16, dist.input_dim))
+    return dist, mlp
+
+
+@pytest.mark.parametrize("ordinal", [False, True])
+def test_levels_head_starts_near_rest_and_samples_on_the_grid(ordinal: bool) -> None:
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("rsl_rl")
+    dist, mlp = _levels_head(p_rest=0.9, ordinal=ordinal)
+    dist.init_mlp_weights(mlp)
+    out = mlp(torch.randn(4096, 6)).detach()
+    dist.update(out)
+    p = dist.params[0].exp().reshape(4096, 6, 5)
+    assert torch.allclose(p[..., 0], torch.full((4096, 6), 0.9), atol=0.01)
+    assert torch.allclose(p[..., 1:], torch.full((4096, 6, 4), 0.025), atol=0.005)
+    a = dist.sample()
+    assert a.shape == (4096, 8)
+    assert torch.equal(a[:, :6] * 4, torch.round(a[:, :6] * 4))
+    assert a[:, :6].min() == 0.0 and a[:, :6].max() == 1.0
+    # Sampled frequencies follow the probabilities.
+    assert (a[:, :6] == 0).float().mean() == pytest.approx(0.9, abs=0.01)
+    assert dist.mean[:, :6].mean() == pytest.approx(0.0625, abs=0.003)
+    assert dist.stats()["p_rest"] == pytest.approx(0.9, abs=0.01)
+
+
+@pytest.mark.parametrize("ordinal", [False, True])
+def test_levels_head_matches_torch_distributions(ordinal: bool) -> None:
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("rsl_rl")
+    from torch.distributions import Categorical, Normal, kl_divergence
+
+    from myosuite.integrations.yoga.levels import level_logits
+
+    dist, mlp = _levels_head(init_std=0.3, ordinal=ordinal)
+    out, out2 = mlp(torch.randn(64, 6)).detach(), mlp(torch.randn(64, 6)).detach()
+    logits = level_logits(out[:, :30].reshape(64, 6, 5), ordinal)
+    cat, gauss = Categorical(logits=logits), Normal(out[:, 30:], 0.3)
+    dist.update(out)
+    a = dist.sample()
+    idx = torch.round(a[:, :6] * 4).long()
+    expected = cat.log_prob(idx).sum(-1) + gauss.log_prob(a[:, 6:]).sum(-1)
+    assert torch.allclose(dist.log_prob(a), expected, atol=1e-5)
+    entropy = cat.entropy().sum(-1) + gauss.entropy().sum(-1)
+    assert torch.allclose(dist.entropy, entropy, atol=1e-5)
+    old = tuple(p.detach() for p in dist.params)
+    assert dist.kl_divergence(old, old).abs().max() < 1e-6
+    dist.update(out2)
+    cat2 = Categorical(logits=level_logits(out2[:, :30].reshape(64, 6, 5), ordinal))
+    kl = kl_divergence(cat, cat2).sum(-1) + kl_divergence(
+        gauss, Normal(out2[:, 30:], 0.3)
+    ).sum(-1)
+    assert torch.allclose(dist.kl_divergence(old, dist.params), kl, atol=1e-5)
+    if ordinal:  # output k is the log-odds of level k against level k - 1
+        logp = dist.params[0].reshape(64, 6, 5)
+        steps = out2[:, :30].reshape(64, 6, 5)[..., 1:]
+        assert torch.allclose(logp[..., 1:] - logp[..., :-1], steps, atol=1e-5)
+
+
+def test_levels_head_deterministic_outputs() -> None:
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("rsl_rl")
+    dist, mlp = _levels_head()
+    out = mlp(torch.randn(32, 6)).detach()
+    p = out[:, :30].reshape(32, 6, 5).softmax(-1)
+    values = torch.linspace(0.0, 1.0, 5)
+    mean = dist.deterministic_output(out)
+    assert torch.allclose(mean[:, :6], (p * values).sum(-1), atol=1e-6)
+    assert torch.equal(mean[:, 6:], out[:, 30:])
+    assert torch.allclose(dist.as_deterministic_output_module()(out), mean)
+    dist.det = "mode"
+    mode = dist.deterministic_output(out)
+    assert torch.equal(mode[:, :6], values[p.argmax(-1)])
+
+
+def _random_bodies(torch, n: int, b: int, s: int):
+    from mjlab.utils.lab_api.math import matrix_from_quat
+
+    gen = torch.Generator().manual_seed(3)
+
+    def rand(*shape):
+        return torch.randn(*shape, generator=gen)
+
+    rot = matrix_from_quat(torch.nn.functional.normalize(rand(n, b, 4), dim=-1))
+    ref_rot = matrix_from_quat(torch.nn.functional.normalize(rand(n, s, b, 4), dim=-1))
+    ref = torch.cat(
+        [rand(n, s, b, 3), ref_rot[..., 0], ref_rot[..., 2], rand(n, s, b, 6)], dim=-1
+    )
+    return rand(n, b, 3), rot, rand(n, b, 3), rand(n, b, 3), ref
+
+
+def test_body_observation_ignores_place_and_heading() -> None:
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("mjlab")
+    from myosuite.integrations.yoga.body_obs import (
+        body_state_obs,
+        preview_obs,
+        target_pose_obs,
+    )
+
+    n, b, s = 5, 7, 3
+    pos, rot, lin, ang, ref = _random_bodies(torch, n, b, s)
+    state = body_state_obs(pos, rot, lin, ang)
+    target = target_pose_obs(pos, rot, lin, ang, ref)
+    preview = preview_obs(pos, rot, ref[..., :3])
+    assert state.shape == (n, 1 + 3 * (b - 1) + 12 * b)
+    assert target.shape == (n, s * 24 * b)
+    assert preview.shape == (n, s * 3 * b)
+    # The same motion somewhere else on the floor, facing another way.
+    yaw = torch.tensor([0.3, -2.0, 3.1, 1.2, -0.7])
+    c, s_ = yaw.cos(), yaw.sin()
+    zero, one = torch.zeros(n), torch.ones(n)
+    turn = torch.stack(
+        [torch.stack([c, -s_, zero], -1), torch.stack([s_, c, zero], -1), torch.stack([zero, zero, one], -1)], -2
+    )  # fmt: skip
+    shift = torch.tensor([[1.5, -4.0, 0.0]])
+
+    def moved(v, is_pos=False):
+        t = turn.reshape(n, *([1] * (v.dim() - 2)), 3, 3)
+        out = (t @ v.unsqueeze(-1)).squeeze(-1)
+        return out + shift.reshape(1, *([1] * (v.dim() - 2)), 3) if is_pos else out
+
+    rot2 = turn[:, None] @ rot
+    ref2 = torch.cat(
+        [moved(ref[..., 0:3], True), moved(ref[..., 3:6]), moved(ref[..., 6:9]),
+         moved(ref[..., 9:12]), moved(ref[..., 12:15])], dim=-1
+    )  # fmt: skip
+    args = (moved(pos, True), rot2, moved(lin), moved(ang))
+    assert torch.allclose(body_state_obs(*args), state, atol=1e-5)
+    assert torch.allclose(target_pose_obs(*args, ref2), target, atol=1e-5)
+    assert torch.allclose(preview_obs(args[0], rot2, ref2[..., :3]), preview, atol=1e-5)
+    # A reference equal to the present state reads as zero error.
+    here = torch.cat([pos, rot[..., 0], rot[..., 2], lin, ang], dim=-1)[:, None]
+    same = target_pose_obs(pos, rot, lin, ang, here)
+    assert same[:, 3 * b : 6 * b].abs().max() < 1e-6  # position error
+    assert same[:, 18 * b :].abs().max() < 1e-6  # velocity differences
+    local = same[:, 12 * b : 18 * b].reshape(n, b, 6)  # target axes in the body frames
+    unit = torch.tensor([1.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+    assert torch.allclose(local, unit.expand(n, b, 6), atol=1e-5)
+
+
+def test_body_observation_heading_is_continuous_through_an_inversion() -> None:
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("mjlab")
+    from myosuite.integrations.yoga.body_obs import heading_cos_sin
+
+    # The root pitches about its lateral axis from upright to upside down (a fold, then a
+    # handstand). Its frame: x forward, y up, z right; the subject faces world +x.
+    pitch = torch.linspace(0.0, torch.pi, 181)
+    c, s = pitch.cos(), pitch.sin()
+    zero = torch.zeros_like(pitch)
+    forward = torch.stack([c, zero, -s], -1)
+    lateral = torch.stack([zero, -torch.ones_like(pitch), zero], -1)
+    cos, sin = heading_cos_sin(lateral)
+    assert torch.allclose(cos, torch.ones_like(cos)) and sin.abs().max() < 1e-6
+    # The forward axis has no horizontal part at 90 degrees and points backwards after it.
+    assert forward[90, :2].norm() < 1e-6 and forward[180, 0] < -0.99
+
+
+def test_reference_bodies_match_mujoco(base_model: mujoco.MjModel) -> None:
+    from myosuite.integrations.yoga import subject_body as sb
+    from myosuite.integrations.yoga.body_obs import OBS_BODIES, body_kinematics
+
+    rng = np.random.default_rng(4)
+    qpos = sb.sample_poses(base_model, 3, seed=5)
+    qvel = rng.normal(0.0, 1.0, (3, base_model.nv))
+    ids = np.array([base_model.body(n).id for n in OBS_BODIES])
+    rows = body_kinematics(base_model, qpos, qvel, ids)
+    assert rows.shape == (3, len(OBS_BODIES), 15)
+    data = mujoco.MjData(base_model)
+    vel = np.zeros(6)
+    for f in range(3):
+        data.qpos[:], data.qvel[:] = qpos[f], qvel[f]
+        mujoco.mj_forward(base_model, data)
+        for j, b in enumerate(ids):
+            mat = data.xmat[b].reshape(3, 3)
+            mujoco.mj_objectVelocity(base_model, data, mujoco.mjtObj.mjOBJ_XBODY, b, vel, 0)  # fmt: skip
+            expected = np.r_[data.xpos[b], mat[:, 0], mat[:, 2], vel[3:], vel[:3]]
+            np.testing.assert_allclose(rows[f, j], expected, atol=2e-5)
+    # At rest when no velocities are given.
+    assert np.abs(body_kinematics(base_model, qpos, None, ids)[..., 9:]).max() == 0.0
+
+
+def test_muscle_scales_normalise_to_the_muscle_model(
+    base_model: mujoco.MjModel,
+) -> None:
+    from myosuite.integrations.yoga.body_obs import muscle_scales
+
+    sc = muscle_scales(base_model)
+    n = int((base_model.actuator_dyntype == mujoco.mjtDyn.mjDYN_MUSCLE).sum())
+    assert len(sc["ids"]) == n and n > 300
+    lr = base_model.actuator_lengthrange[sc["ids"]]
+    gp = base_model.actuator_gainprm[sc["ids"]]
+    # The ends of the tendon length range map onto the ends of the operating range.
+    np.testing.assert_allclose(
+        sc["range0"] + (lr[:, 1] - sc["lo"]) / sc["l0"], gp[:, 1]
+    )
+    assert sc["f0"].min() > 0 and sc["vmax"].min() > 0
+
+
+def test_levels_head_without_gaussian_outputs() -> None:
+    """With the neck on a servo every output is a muscle: no Gaussian part."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("rsl_rl")
+    from torch import nn
+    from torch.distributions import Categorical
+
+    from myosuite.integrations.yoga.levels import LevelsDistribution
+
+    torch.manual_seed(0)
+    dist = LevelsDistribution(output_dim=6, levels=5, n_gauss=0)
+    assert dist.input_dim == 30 and dist.std_param.numel() == 0
+    out = nn.Linear(4, 30)(torch.randn(16, 4)).detach()
+    dist.update(out)
+    a = dist.sample()
+    assert a.shape == (16, 6)
+    cat = Categorical(logits=out.reshape(16, 6, 5))
+    idx = torch.round(a * 4).long()
+    assert torch.allclose(dist.log_prob(a), cat.log_prob(idx).sum(-1), atol=1e-5)
+    assert torch.allclose(dist.entropy, cat.entropy().sum(-1), atol=1e-5)
+    old = tuple(p.detach() for p in dist.params)
+    assert dist.kl_divergence(old, old).abs().max() < 1e-6
+    assert dist.deterministic_output(out).shape == (16, 6)
+    assert "neck_std" not in dist.stats()
+
+
+def test_neck_servo_gains_are_damped_on_each_hinge(
+    neck_model: mujoco.MjModel,
+) -> None:
+    from myosuite.integrations.yoga import subject_body as sb
+    from myosuite.integrations.yoga.neck import NeckServoActionCfg, neck_servo_gains
+
+    kp, kd = neck_servo_gains(neck_model, 100.0, 1.0)
+    inertia = kd**2 / (4.0 * kp)
+    assert np.all(kp == 100.0)
+    # The head turns about its long axis far more easily than it nods or tilts.
+    assert inertia[2] < 0.3 * inertia[0] and inertia[2] < 0.3 * inertia[1]
+    assert 0.05 < inertia[0] < 0.4
+    # A held PD is stable only below kd dt / I = 2.
+    assert np.all(kd * neck_model.opt.timestep / inertia < 0.5)
+    cfg = NeckServoActionCfg(entity_name="e", mj_model=neck_model, clips=(), ctrl_dt=0.01)  # fmt: skip
+    assert [neck_model.joint(j).qposadr[0] for j in sb.NECK_JOINTS] == cfg.qadr
+    assert cfg.gear == [30.0, 30.0, 30.0]
+
+
+def _start_sampler(**kw):
+    from myosuite.envs.myo.backends.mjlab.start_sampling import (
+        AdaptiveStartsCfg,
+        FailureWeightedStarts,
+    )
+
+    cfg = AdaptiveStartsCfg(**{"min_hazard": 1e-9, "prior_visits": 0.0, "lead": 0, **kw})  # fmt: skip
+    return FailureWeightedStarts([250, 400], 100, 0.01, 8, cfg, "cpu")
+
+
+def _episodes(torch, rows):
+    """``(env, clip, start, end, failed)`` rows as the sampler's arguments."""
+    env, clip, start, end, failed = (torch.tensor(c) for c in zip(*rows))
+    return env, clip, start, end, failed.bool()
+
+
+def test_failure_weighted_starts_are_uniform_without_failures() -> None:
+    torch = pytest.importorskip("torch")
+    s = _start_sampler()
+    p = s.start_probabilities()
+    # A clip uniformly, then one of its starts uniformly: 3 and 4 starts.
+    assert torch.allclose(p, torch.tensor([1 / 6] * 3 + [1 / 8] * 4))
+    clips, frames = s.sample(4000)
+    assert set(frames[clips == 0].tolist()) == {0, 100, 200}
+    assert set(frames[clips == 1].tolist()) == {0, 100, 200, 300}
+    assert (clips == 0).float().mean() == pytest.approx(0.5, abs=0.04)
+    # Episodes that reach their time limit are visits, not failures.
+    s.observe(1, *_episodes(torch, [(0, 1, 0, 400, False), (1, 0, 100, 250, False)]))
+    assert torch.equal(s.visit > 0, torch.tensor([0, 1, 1, 1, 1, 1, 1]).bool())
+    assert float(s.fail.sum()) == 0.0 and s.stats()["weighted_share"] == 0.0
+    assert s.stats()["clip_pass_estimate"] == pytest.approx(1.0)
+
+
+def test_failure_weighted_starts_follow_the_failure_rate_not_the_count() -> None:
+    torch = pytest.importorskip("torch")
+    s = _start_sampler(uniform=0.3, kernel=3, decay=0.8)
+    # Clip 1: four episodes from frame 0; one ends early in its second bin, the others
+    # go on and all three end early in its last bin.
+    rows = [(0, 1, 0, 150, True)] + [(e, 1, 0, 350, True) for e in (1, 2, 3)]
+    # Clip 0: one episode passes all of it.
+    rows.append((4, 0, 0, 250, False))
+    s.observe(10, *_episodes(torch, rows))
+    hazard = s.hazard()
+    assert torch.allclose(hazard, torch.tensor([0, 0, 0, 0, 0.25, 0, 1.0]))
+    assert s.clip_pass_estimate().tolist() == pytest.approx([1.0, 0.0], abs=1e-5)
+    w = torch.tensor([1.0, 0.8, 0.64]) / 2.44
+    spread = torch.zeros(7)
+    # The clip's first start also takes the weight that would fall before the clip.
+    spread[3] += 0.25 * (w[1] + w[2])
+    spread[4] += 0.25 * w[0] + 1.0 * w[2]
+    spread[5] += 1.0 * w[1]
+    spread[6] += 1.0 * w[0]
+    uniform = torch.tensor([1 / 6] * 3 + [1 / 8] * 4)
+    share = s.weighted_share()
+    assert share == pytest.approx(0.7, abs=1e-6)
+    expected = share * spread / spread.sum() + (1 - share) * uniform
+    assert torch.allclose(s.start_probabilities(), expected, atol=1e-6)
+    assert s.stats()["top_start_s"] == 3.0
+    # Nothing of clip 1's failures reaches clip 0.
+    assert torch.allclose(s.start_probabilities()[:3], 0.3 * uniform[:3], atol=1e-6)
+    clips, frames = _start_sampler(uniform=0.0).sample(10)
+    assert bool((frames % 100 == 0).all())
+    # With a lead the starts are before the failing second: here all on the first frame.
+    led = _start_sampler(uniform=0.0, kernel=2, lead=1)
+    led.observe(10, *_episodes(torch, [(0, 1, 0, 150, True)]))
+    assert torch.allclose(led.start_probabilities(), torch.tensor([0, 0, 0, 1.0, 0, 0, 0]))  # fmt: skip
+    led.observe(10, *_episodes(torch, [(1, 1, 0, 350, True), (2, 0, 0, 250, False)]))
+    p = led.start_probabilities()
+    assert float(p[:3].sum()) < 1e-6 and float(p[6]) < 1e-6 and float(p[5]) > 0.1
+
+
+def test_failure_weighted_starts_ignore_early_falls_and_forget() -> None:
+    torch = pytest.importorskip("torch")
+    s = _start_sampler(min_fail_s=0.75, alpha=0.01)
+    # 0.5 s after its start: the start state is to blame, not the policy.
+    s.observe(5, *_episodes(torch, [(0, 0, 100, 150, True)]))
+    assert float(s.fail.sum()) == 0.0 and float(s.visit.sum()) == 0.0
+    assert s.start_quality().tolist() == pytest.approx([1, 0, 1, 1, 1, 1, 1])
+    # A start that cannot be survived gets none of the weighted share.
+    dead = _start_sampler(uniform=0.0, kernel=2, lead=0)
+    rows = [(0, 1, 100, 150, True), (1, 1, 0, 180, True), (2, 1, 0, 180, True)]
+    dead.observe(5, *_episodes(torch, rows))
+    assert dead.hazard().tolist() == pytest.approx([0, 0, 0, 0, 1, 0, 0])
+    assert torch.allclose(dead.start_probabilities(), torch.tensor([0, 0, 0, 1.0, 0, 0, 0]))  # fmt: skip
+    # From the clip's first frame every fall counts.
+    first = _start_sampler(min_fail_s=0.75, alpha=0.01)
+    first.observe(5, *_episodes(torch, [(0, 0, 0, 50, True)]))
+    assert first.fail.tolist() == pytest.approx([0.01, 0, 0, 0, 0, 0, 0])
+    s.observe(6, *_episodes(torch, [(0, 0, 100, 180, True)]))
+    assert s.fail.tolist() == pytest.approx([0, 0.01, 0, 0, 0, 0, 0])
+    s.observe(106, *_episodes(torch, [(0, 0, 0, 0, False)]))
+    assert float(s.fail.sum()) == pytest.approx(0.01 * 0.99**100)
+    # An episode flagged before it ended (shifted clocks) is left out, once.
+    s2 = _start_sampler()
+    s2.skip_running_episodes()
+    s2.observe(1, *_episodes(torch, [(3, 0, 0, 180, True)]))
+    assert float(s2.visit.sum()) == 0.0
+    s2.observe(2, *_episodes(torch, [(3, 0, 0, 180, True)]))
+    assert float(s2.fail.sum()) > 0.0
+    # With few failures the starts return to uniform; few visits damp a bin's rate.
+    rare = _start_sampler(min_hazard=0.05, uniform=0.3)
+    rows = [(0, 0, 0, 180, True)] + [(e, 0, 0, 250, False) for e in range(1, 8)] * 20
+    rare.observe(1, *_episodes(torch, rows))
+    assert rare.hazard().max() == pytest.approx(1 / 141)
+    assert rare.weighted_share() < 0.05
+    damped = _start_sampler(prior_visits=20.0)
+    damped.observe(1, *_episodes(torch, [(0, 0, 0, 180, True)]))
+    assert float(damped.hazard().max()) == pytest.approx(1 / 21)

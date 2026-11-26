@@ -114,6 +114,21 @@ R3_WRIST_EXTENSION_DEG = 110.0
 # line; her pressure-mat COP in static holds puts it ~3 cm in front
 # (notes/muscle_yoga/com_vs_pressure_mat.md).
 R4_COM_FORWARD: dict[str, float] = {"torso": 0.03, "head": 0.03}
+# Round 5, for MuJoCo 4's side-site rule (notes: mujoco4_muscle_paths_and_v5.md).
+# Wrist obstacles whose forearm point passes the ray opposite a palmar side site inside the
+# wrist's range: the side site is turned to the middle of the forearm point's sweep.
+R5_WRIST_TURN_DEG: dict[str, float] = {
+    **{f"FDS{i}": 66.0 for i in range(2, 6)},
+    **{f"FDP{i}": 66.0 for i in range(2, 6)},
+    "FPL": 43.0,
+}  # fmt: skip
+# Humerus cylinder of teres major and latissimus 2: side site -> (cylinder, turn in degrees)
+# to the middle of the arc MuJoCo 3 wrapped (all path points there are fixed to the humerus).
+R5_SIDESITE_TURN: dict[str, tuple[str, float]] = {
+    "TMAJ_LAThum_cylinder_TMAJ_1_sidesite": ("TMAJ_LAThum_cylinder", 64.2),
+    "TMAJ_LAThum_cylinder_LAT2_1_sidesite": ("TMAJ_LAThum_cylinder", 54.8),
+}
+R5_FRICTION: tuple[str, float] = ("elliptic", 100.0)
 
 # Plant body groups whose masses define each MyoFullBody mass group.
 PLANT_MASS_GROUPS: dict[str, tuple[str, ...]] = {
@@ -319,7 +334,17 @@ class SubjectTable:
             a cylinder on the wrist flexion axis that the muscle's path wraps around
             whenever it would pass closer to the axis (:func:`_repair_wrist_paths`).
             MyoArm's paths are built for ±45° of wrist flexion and lose or invert their
-            moment arms beyond it.
+            moment arms beyond it. An optional third number turns the obstacle's side
+            site about the axis, in degrees from that side towards the forearm point
+            (MuJoCo 4 routes the tendon like the polyline through the side site, and
+            the path jumps when the forearm point passes the ray opposite to it).
+        sidesite_turn: Side site name -> ``[wrap geom, degrees]``: the site is turned
+            about that cylinder's axis (both on one body). For side sites placed under
+            MuJoCo 3's rule that select the other way round under MuJoCo 4's.
+        friction_cone: ``"pyramidal"`` (MuJoCo's default) or ``"elliptic"``.
+        impratio: Ratio of frictional to normal constraint impedance. With the
+            elliptic cone a contact under steady shear slides in proportion to
+            ``1 / impratio``.
         limit_solref: Joint name -> ``solref`` of its range limit.
         limit_solimp: Joint name -> ``solimp`` of its range limit. A stiff end-range
             (ligament and bone, :data:`STIFF_LIMIT_SOLREF`) instead of MuJoCo's default
@@ -357,6 +382,9 @@ class SubjectTable:
     limit_solimp: dict[str, list[float]] = field(default_factory=dict)
     strength_scale: dict[str, float] = field(default_factory=dict)
     com_forward: dict[str, float] = field(default_factory=dict)
+    sidesite_turn: dict[str, list] = field(default_factory=dict)
+    friction_cone: str = "pyramidal"
+    impratio: float = 1.0
 
     def save(self, path: Path) -> None:
         """Write as JSON."""
@@ -686,6 +714,31 @@ def _palmar_direction(model: mujoco.MjModel, side: str) -> np.ndarray:
     return palmar if palmar @ flexor > 0 else -palmar
 
 
+def _turn_sidesites(
+    spec: mujoco.MjSpec, model: mujoco.MjModel, turns: dict[str, list]
+) -> None:
+    """Turn each named side site about the axis of its wrap cylinder (same body)."""
+    for name, (geom, degrees) in turns.items():
+        gid, sid = model.geom(geom).id, model.site(name).id
+        if model.geom_bodyid[gid] != model.site_bodyid[sid]:
+            raise ValueError(f"{name} and {geom} are on different bodies")
+        mat = np.zeros(9)
+        mujoco.mju_quat2Mat(mat, model.geom_quat[gid])
+        axis = mat.reshape(3, 3)[:, 2]
+        centre = np.asarray(spec.geom(geom).pos, float)
+        site = spec.site(name)
+        arm = np.asarray(site.pos, float) - centre
+        along = axis * (axis @ arm)
+        radial = arm - along
+        angle = np.radians(degrees)
+        site.pos = (
+            centre
+            + along
+            + np.cos(angle) * radial
+            + np.sin(angle) * np.cross(axis, radial)
+        )
+
+
 def _repair_wrist_paths(
     spec: mujoco.MjSpec, model: mujoco.MjModel, table: SubjectTable
 ) -> None:
@@ -710,15 +763,17 @@ def _repair_wrist_paths(
     """
     muscles = {model.actuator(i).name: i for i in range(model.nu)}
     quat = np.zeros(4)
+    data = _rest(model)
     for side in SIDES:
         hand = {model.body(n).id for n in _descendants(model, f"lunate_{side}")}
+        lb = model.body(f"lunate_{side}").id
         jid = model.joint(f"flexion_{side}").id
         centre, axis = model.jnt_pos[jid], model.jnt_axis[jid]
         mujoco.mju_quatZ2Vec(quat, axis)
         palmar = _palmar_direction(model, side)
         lunate = spec.body(f"lunate_{side}")
         k = float(table.segment_scale.get(f"hand_{side}", 1.0))
-        for base_name, (radius, sgn) in table.wrist_obstacles.items():
+        for base_name, (radius, sgn, *turn) in table.wrist_obstacles.items():
             muscle = _arm_name(base_name, side)
             if muscle not in muscles:
                 continue
@@ -736,7 +791,8 @@ def _repair_wrist_paths(
             path: list[tuple] = []
             for item in _tendon_path(model, tendon):
                 if item[0] == "site":
-                    path.append((*item, int(model.site_bodyid[model.site(item[1]).id])))
+                    sid = model.site(item[1]).id
+                    path.append((*item, int(model.site_bodyid[sid]), data.site_xpos[sid]))
                     continue
                 gid = model.geom(item[1]).id
                 body = int(model.geom_bodyid[gid])
@@ -747,12 +803,23 @@ def _repair_wrist_paths(
                         name=f"{muscle}_{item[1]}_via", pos=np.asarray(spec.geom(item[1]).pos),
                         size=[0.001, 0.0, 0.0], group=WRAP_GROUP,
                     )  # fmt: skip
-                    path.append(("site", via.name, body))
+                    path.append(("site", via.name, body, data.geom_xpos[gid]))
             sites = [i for i, it in enumerate(path) if it[0] == "site"]
             j = next(
                 j for j in range(1, len(sites))
                 if path[sites[j]][2] in hand and path[sites[j - 1]][2] not in hand
             )  # fmt: skip
+            if turn and turn[0]:  # about the axis, towards the forearm point at rest
+                forearm = data.xmat[lb].reshape(3, 3).T @ (
+                    path[sites[j - 1]][3] - data.xpos[lb]
+                )
+                towards = sgn * palmar
+                across = np.cross(axis, towards)
+                across *= np.sign(across @ (forearm - centre)) or 1.0
+                angle = np.radians(turn[0])
+                sidesite.pos = centre + (r + 0.004) * (
+                    np.cos(angle) * towards + np.sin(angle) * across
+                )
             path = (
                 path[: sites[j - 1] + 1]
                 + [("geom", geom.name, sidesite.name)]
@@ -784,6 +851,13 @@ def build_subject_spec(
     _apply_ranges(spec, model, table)
     if table.wrist_obstacles:
         _repair_wrist_paths(spec, model, table)
+    if table.sidesite_turn:
+        _turn_sidesites(spec, model, table.sidesite_turn)
+    if table.friction_cone != "pyramidal" or table.impratio != 1.0:
+        spec.option.cone = getattr(
+            mujoco.mjtCone, f"mjCONE_{table.friction_cone.upper()}"
+        )
+        spec.option.impratio = table.impratio
     for act in spec.actuators:
         if act.name in table.lengthrange:
             act.lengthrange = np.asarray(table.lengthrange[act.name], float)
@@ -990,6 +1064,31 @@ def upgrade_table(
     )  # fmt: skip
 
 
+def round5_table(table: SubjectTable) -> SubjectTable:
+    """*table* with the round-5 plant: side sites for MuJoCo 4, floor friction that holds.
+
+    Args:
+        table: A round-3 or round-4 table (with wrist obstacles).
+
+    Returns:
+        The table with :data:`R5_WRIST_TURN_DEG`, :data:`R5_SIDESITE_TURN` and
+        :data:`R5_FRICTION` applied.
+    """
+    obstacles = {
+        k: [*v[:2], R5_WRIST_TURN_DEG[k]] if k in R5_WRIST_TURN_DEG else list(v)
+        for k, v in table.wrist_obstacles.items()
+    }
+    turns = {
+        _arm_name(site, s): [_arm_name(geom, s), deg]
+        for site, (geom, deg) in R5_SIDESITE_TURN.items()
+        for s in SIDES
+    }
+    return replace(
+        table, wrist_obstacles=obstacles, sidesite_turn=turns,
+        friction_cone=R5_FRICTION[0], impratio=R5_FRICTION[1],
+    )  # fmt: skip
+
+
 def fit_subject_table(
     plant_xml: Path,
     mosh_pkl: Path,
@@ -1115,6 +1214,10 @@ def main() -> None:
         "--recentre", type=Path, default=None,
         help="instead of fitting: write this table with the round-4 mass placement (R4_COM_FORWARD)",
     )  # fmt: skip
+    ap.add_argument(
+        "--round5", type=Path, default=None,
+        help="instead of fitting: write this table with the round-5 plant (round5_table)",
+    )  # fmt: skip
     ap.add_argument("--wrist-extension-deg", type=float, default=R3_WRIST_EXTENSION_DEG)
     ap.add_argument("--undo-shoulder-edit", action="store_true")
     ap.add_argument("--no-neck", action="store_true")
@@ -1138,6 +1241,12 @@ def main() -> None:
         )
         table.save(args.out)
         print(f"wrote {args.out}: com_forward {table.com_forward}")
+        return
+    if args.round5 is not None:
+        table = round5_table(SubjectTable.load(args.round5))
+        table.save(args.out)
+        print(f"wrote {args.out}: friction {table.friction_cone} {table.impratio}, "
+              f"{len(table.sidesite_turn)} side sites turned, wrist turns {R5_WRIST_TURN_DEG}")  # fmt: skip
         return
     if args.upgrade is not None:
         table = upgrade_table(

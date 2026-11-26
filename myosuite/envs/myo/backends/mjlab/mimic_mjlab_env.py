@@ -1237,12 +1237,90 @@ def _mimic_obs_lookahead(
 # ---------------------------------------------------------------------------
 
 
+def _rsi_start_frames(rand: Any, clip_lengths: Any, interval: int | None) -> Any:
+    """Start frames for uniform draws *rand* in ``[0, 1)``.
+
+    Args:
+        rand: ``(N,)`` uniform draws.
+        clip_lengths: ``(N,)`` clip lengths in frames.
+        interval: ``None``: any frame. Otherwise only frames ``0, interval, 2 interval, ...``.
+
+    Returns:
+        ``(N,)`` long start frames, each below its clip length.
+    """
+    import torch
+
+    if interval is None:
+        return torch.floor(rand * clip_lengths.float()).to(dtype=torch.long)
+    n_starts = torch.div(clip_lengths + interval - 1, interval, rounding_mode="floor")
+    starts = torch.floor(rand * n_starts.float()).to(dtype=torch.long)
+    return torch.minimum(starts, n_starts - 1) * interval
+
+
+def _start_sampler(
+    cache: dict[str, Any],
+    clip_source: Any,
+    is_bank: bool,
+    start_interval: int | None,
+    ctrl_dt: float,
+    adaptive: Any,
+    n_envs: int,
+    device: Any,
+) -> Any:
+    """The env's failure-weighted start sampler (built at the first reset)."""
+    sampler = cache.get("start_sampler")
+    if sampler is None:
+        from myosuite.envs.myo.backends.mjlab.start_sampling import (
+            FailureWeightedStarts,
+        )
+
+        lengths = (
+            clip_source._clip_lengths.tolist() if is_bank else [clip_source.n_frames]
+        )
+        # Without a start grid a bin is one second of the clip.
+        bin_steps = start_interval or max(1, round(1.0 / ctrl_dt))
+        sampler = FailureWeightedStarts(
+            lengths, bin_steps, ctrl_dt, n_envs, adaptive, device
+        )
+        cache["start_sampler"] = sampler
+    return sampler
+
+
+def _observe_episodes(
+    env: Any, sampler: Any, clip_source: Any, is_bank: bool, env_ids: Any
+) -> None:
+    """Report the episodes of *env_ids* that just ended to the start sampler.
+
+    Runs inside the reset event: mjlab clears the episode clocks and the clip
+    assignment only afterwards, so both still describe the episode that ended.
+    """
+    import torch
+
+    terminations = getattr(env, "termination_manager", None)
+    if terminations is None:
+        return
+    starts = clip_source._start_offsets[env_ids]
+    clip_ids = (
+        clip_source._clip_indices[env_ids] if is_bank else torch.zeros_like(env_ids)
+    )
+    sampler.observe(
+        int(env.common_step_counter),
+        env_ids,
+        clip_ids,
+        starts,
+        starts + _mimic_episode_steps(env)[env_ids],
+        terminations.terminated[env_ids],
+    )
+
+
 def _mimic_rsi_event(
     entity_name: str,
     variant: str,
     clip: MotionClip | tuple[MotionClip, ...],
     ctrl_dt: float,
     mj_model: Any | None = None,
+    start_interval: int | None = None,
+    adaptive: Any | None = None,
 ) -> Callable[[Any, Any], None]:
     """Reset-event that sets qpos/qvel from the motion clip (RSI).
 
@@ -1258,11 +1336,21 @@ def _mimic_rsi_event(
         ctrl_dt: Control timestep (used to initialise :class:`ClipTrajectorySource`).
         mj_model: Optional MuJoCo model for handling fixed-base entities with
             auxiliary free joints.
+        start_interval: ``None``: start at any frame. Otherwise start only at
+            every *start_interval*-th frame (uniform over those), so frame 0 and
+            the other grid frames are each a start of many episodes.
+        adaptive: :class:`~.start_sampling.AdaptiveStartsCfg`: draw part of the
+            starts in proportion to where episodes end early (``None``: uniform).
 
     Returns:
         Closure ``(env, env_ids) -> None`` suitable for
         ``EventTermCfg(mode="reset")``.
+
+    Raises:
+        ValueError: If *start_interval* is below 1.
     """
+    if start_interval is not None and start_interval < 1:
+        raise ValueError(f"start_interval must be at least 1, got {start_interval}")
 
     def _fn(env: Any, env_ids: Any) -> None:
         import torch
@@ -1296,7 +1384,31 @@ def _mimic_rsi_event(
                 env_ids, device=device, dtype=torch.long
             ).reshape(-1)
         n_reset = int(env_ids_long.shape[0])
-        if hasattr(clip_source, "_clip_indices") and hasattr(clip_source, "clips"):
+        is_bank = hasattr(clip_source, "_clip_indices") and hasattr(
+            clip_source, "clips"
+        )
+        sampler = None
+        if adaptive is not None:
+            sampler = _start_sampler(
+                cache, clip_source, is_bank, start_interval, ctrl_dt, adaptive, n_envs, device
+            )  # fmt: skip
+            _observe_episodes(env, sampler, clip_source, is_bank, env_ids_long)
+        if sampler is not None:
+            new_clip_indices, new_offsets = sampler.sample(n_reset)
+            lengths = (
+                clip_source._clip_lengths.index_select(0, new_clip_indices)
+                if is_bank
+                else clip_source.n_frames
+            )
+            if start_interval is None:
+                # Any frame of the drawn bin.
+                new_offsets = new_offsets + torch.randint(
+                    0, sampler.bin_steps, (n_reset,), device=device, dtype=torch.long
+                )
+            new_offsets = torch.clamp(new_offsets, max=lengths - 1)
+            if is_bank:
+                clip_source._clip_indices[env_ids_long] = new_clip_indices
+        elif is_bank:
             new_clip_indices = torch.randint(
                 0,
                 len(clip_source.clips),
@@ -1305,14 +1417,17 @@ def _mimic_rsi_event(
                 dtype=torch.long,
             )
             clip_lengths = clip_source._clip_lengths.index_select(0, new_clip_indices)
-            new_offsets = torch.floor(
-                torch.rand(n_reset, device=device, dtype=torch.float32)
-                * clip_lengths.float()
-            ).to(dtype=torch.long)
+            new_offsets = _rsi_start_frames(
+                torch.rand(n_reset, device=device, dtype=torch.float32),
+                clip_lengths,
+                start_interval,
+            )
             clip_source._clip_indices[env_ids_long] = new_clip_indices
         else:
-            new_offsets = torch.randint(
-                0, clip_source.n_frames, (n_reset,), device=device, dtype=torch.long
+            every = start_interval or 1
+            n_starts = -(-clip_source.n_frames // every)
+            new_offsets = every * torch.randint(
+                0, n_starts, (n_reset,), device=device, dtype=torch.long
             )
         clip_source._start_offsets[env_ids_long] = new_offsets
         # mjlab zeroes episode_length_buf after the reset events; mark these
@@ -1542,6 +1657,8 @@ def _make_mimic_env_cfg(
     reward_mode: str = _MIMIC_REWARD_MODE_MIMIC,
     mimic_reward_weight: float = 5.0,
     max_site_err_threshold: float | None = None,
+    rsi_start_interval: int | None = None,
+    rsi_adaptive: Any | None = None,
 ) -> Any:
     """Build :class:`~mjlab.envs.ManagerBasedRlEnvCfg` for one Mimic task.
 
@@ -1574,6 +1691,10 @@ def _make_mimic_env_cfg(
             ``[-1, 1]`` before writing them as muscle controls.
         max_site_err_threshold: Optional per-site deviation (m) that also ends an
             episode early; ``None`` keeps the mean-site and root rules only.
+        rsi_start_interval: Episodes start only at every N-th clip frame
+            (:func:`_mimic_rsi_event`); ``None`` starts at any frame.
+        rsi_adaptive: :class:`~.start_sampling.AdaptiveStartsCfg`: starts weighted by
+            where episodes end early; ``None`` keeps them uniform.
 
     Returns:
         A configured :class:`~mjlab.envs.ManagerBasedRlEnvCfg` instance.
@@ -1704,7 +1825,13 @@ def _make_mimic_env_cfg(
     if clip is not None and enable_clip_state_terms and has_clip_qpos:
         events["rsi"] = EventTermCfg(
             func=_mimic_rsi_event(
-                entity_name, variant, clip, ctrl_dt, mj_model=mj_model
+                entity_name,
+                variant,
+                clip,
+                ctrl_dt,
+                mj_model=mj_model,
+                start_interval=rsi_start_interval,
+                adaptive=rsi_adaptive,
             ),
             mode="reset",
         )
